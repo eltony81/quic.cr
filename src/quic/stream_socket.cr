@@ -7,11 +7,35 @@ module QUIC
     end
 
     def read(slice : Bytes) : Int32
-      @connection.stream_read(@stream_id, slice)
+      loop do
+        bytes_read = @connection.stream_read(@stream_id, slice)
+        return bytes_read if bytes_read > 0
+        
+        # Check stream state
+        if stream = @connection.streams[@stream_id]?
+          if stream.state == StreamState::Closed || stream.state == StreamState::HalfClosedRemote
+            return 0
+          end
+        else
+          return 0
+        end
+        
+        # Block waiting for stream updates (non-busy waiting)
+        chan = @connection.stream_chans[@stream_id] ||= Channel(Bool).new(5)
+        select
+        when chan.receive
+        when timeout(100.milliseconds)
+        end
+      end
     end
 
     def write(slice : Bytes) : Nil
-      @connection.stream_write(@stream_id, slice)
+      written = 0
+      while written < slice.size
+        n = @connection.stream_write(@stream_id, slice[written..])
+        break if n == 0 # flow-control blocked; caller must pump and retry
+        written += n
+      end
     end
 
     def flush

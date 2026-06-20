@@ -58,45 +58,56 @@ module QUIC
         update_rtt(time_received - packet.time_sent, ack.ack_delay.milliseconds)
       end
 
-      # 2. Mark acknowledged packets
-      (ack.largest_acknowledged - ack.first_ack_range .. ack.largest_acknowledged).each do |pn|
+      # 2. Mark acknowledged packets — first range
+      smallest = ack.largest_acknowledged > ack.first_ack_range ? ack.largest_acknowledged - ack.first_ack_range : 0_u64
+      ack_range(smallest, ack.largest_acknowledged, time_received)
+
+      # Additional ACK ranges (RFC 9000 Section 19.3.1)
+      ack.ack_ranges.each do |(gap, ack_len)|
+        # The next range's largest is gap+2 below the previous range's smallest
+        next_largest = smallest > (gap + 2) ? smallest - gap - 2 : 0_u64
+        next_smallest = next_largest > ack_len ? next_largest - ack_len : 0_u64
+        ack_range(next_smallest, next_largest, time_received)
+        smallest = next_smallest
+      end
+
+      @pto_count = 0 # Reset PTO on successful ACK
+    end
+
+    private def ack_range(from_pn : UInt64, to_pn : UInt64, time_received : Time)
+      (from_pn..to_pn).each do |pn|
         if packet = @sent_packets.delete(pn)
-          @bytes_in_flight -= packet.bytes
-          
+          @bytes_in_flight -= packet.bytes if @bytes_in_flight >= packet.bytes
+
           @bbr_delivered += packet.bytes
           @bbr_delivered_time = time_received
-          
+
           rtt = time_received - packet.time_sent
           @bbr_min_rtt = Math.min(@bbr_min_rtt, rtt)
-          
+
           delivery_interval = time_received - packet.delivered_time
           if delivery_interval > Time::Span.zero
             delivered_diff = @bbr_delivered - packet.delivered
             rate = delivered_diff.to_f / delivery_interval.to_f
             @bbr_max_bandwidth = Math.max(@bbr_max_bandwidth, rate)
           end
-          
+
           if @bbr_enabled
             if @bbr_min_rtt != Time::Span::MAX && @bbr_max_bandwidth > 0.0
               bdp = @bbr_max_bandwidth * @bbr_min_rtt.to_f
               @congestion_window = Math.max(5888_u64, (2.0 * bdp).to_u64)
             end
           else
-            # NewReno Congestion window growth
-            # Non facciamo crescere la finestra se il pacchetto era stato inviato PRIMA del recovery
             if @congestion_recovery_start_time.nil? || packet.time_sent > @congestion_recovery_start_time.not_nil!
               if @congestion_window < @ssthresh
-                # Slow Start
                 @congestion_window += packet.bytes
               else
-                # Congestion Avoidance
                 @congestion_window += (MAX_DATAGRAM_SIZE * packet.bytes) // @congestion_window
               end
             end
           end
         end
       end
-      @pto_count = 0 # Reset PTO on successful ACK
     end
 
     private def update_rtt(latest_rtt : Time::Span, ack_delay : Time::Span)
@@ -144,7 +155,7 @@ module QUIC
 
       lost_pns.each do |pn|
         if packet = @sent_packets.delete(pn)
-          @bytes_in_flight -= packet.bytes
+          @bytes_in_flight -= packet.bytes if @bytes_in_flight >= packet.bytes
           
           if largest_lost_time.nil? || packet.time_sent > largest_lost_time.not_nil!
             largest_lost_time = packet.time_sent

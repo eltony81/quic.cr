@@ -61,71 +61,136 @@ module H3
       config = QUIC::Config.new
       config.cert_file                         = cert
       config.key_file                          = key
-      config.initial_max_data                  = max_data
-      config.initial_max_stream_data_bidi_local  = 1_000_000_u64
-      config.initial_max_stream_data_bidi_remote = 1_000_000_u64
+      config.initial_max_data                  = max_data == 10_000_000_u64 ? 50_000_000_u64 : max_data
+      config.initial_max_stream_data_bidi_local  = 10_000_000_u64
+      config.initial_max_stream_data_bidi_remote = 10_000_000_u64
       config.initial_max_streams_bidi          = 128_u64
       config.initial_max_streams_uni           = 128_u64
-      config.initial_max_stream_data_uni       = 1_000_000_u64
+      config.initial_max_stream_data_uni       = 10_000_000_u64
 
       udp = UDPSocket.new
       udp.bind(host, port)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
 
-      connections    = {} of String => {QUIC::Connection, H3::Connection}
+      connections     = {} of String => {QUIC::Connection, H3::Connection, Socket::IPAddress}
       handled_streams = Set(Tuple(String, UInt64)).new
-      buf    = Bytes.new(65536)
+      
+      event_chan = Channel(Tuple(Symbol, Bytes | String, Socket::IPAddress)).new(1000)
+
+      # Spawn background receiver fiber
+      spawn do
+        buf = Bytes.new(65536)
+        loop do
+          begin
+            size, client_addr = udp.receive(buf)
+            packet_data = Bytes.new(size)
+            buf[0, size].copy_to(packet_data)
+            event_chan.send({:packet, packet_data.as(Bytes | String), client_addr})
+          rescue e
+            break if udp.closed?
+          end
+        end
+      end
+
       out_buf = Bytes.new(65536)
 
       loop do
-        size, client_addr = udp.receive(buf)
-        data = buf[0, size]
+        select
+        when event = event_chan.receive
+          event_type, payload, client_addr = event
+          if event_type == :packet
+            packet_data = payload.as(Bytes)
+            conn_key   = extract_dcid(packet_data)
+            Log.info { "Processing packet for conn_key: #{conn_key} (size: #{packet_data.size})" }
+            conn_tuple = connections[conn_key]?
 
-        conn_key  = extract_dcid(data)
-        conn_tuple = connections[conn_key]?
+            if conn_tuple.nil?
+              Log.debug { "New connection (DCID: #{conn_key})" }
+              quic_conn = QUIC::Connection.new(config, is_server: true)
+              h3_conn   = H3::Connection.new(quic_conn)
+              conn_tuple = {quic_conn, h3_conn, client_addr}
+              connections[conn_key] = conn_tuple
+            end
 
-        if conn_tuple.nil?
-          Log.debug { "New connection (DCID: #{conn_key})" }
-          quic_conn = QUIC::Connection.new(config, is_server: true)
-          h3_conn   = H3::Connection.new(quic_conn)
-          conn_tuple = {quic_conn, h3_conn}
-          connections[conn_key] = conn_tuple
+            quic_conn, h3_conn, _ = conn_tuple
+            # Update current remote address in connection tuple
+            conn_tuple = {quic_conn, h3_conn, client_addr}
+            connections[conn_key] = conn_tuple
 
-          ctrl = h3_conn.open_uni_stream(0_u64)
-          sf   = H3::SettingsFrame.new
-          sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 100_u64, 0x06_u64 => 100_u64}
-          h3_conn.write_frame(ctrl, sf)
-        end
+            was_completed = quic_conn.handshake_complete?
+            quic_conn.recv(packet_data)
 
-        quic_conn, h3_conn = conn_tuple
-        quic_conn.recv(data)
+            # Map the server-chosen Source Connection ID (SCID) to the same connection
+            if scid = quic_conn.scid
+              connections[scid.hexstring] = conn_tuple
+            end
 
-        if scid = quic_conn.scid
-          connections[scid.hexstring] = conn_tuple
-        end
+            # Send control settings stream upon handshake completion
+            if !was_completed && quic_conn.handshake_complete?
+              begin
+                ctrl = h3_conn.open_uni_stream(0_u64)
+                sf   = H3::SettingsFrame.new
+                sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 100_u64, 0x06_u64 => 100_u64}
+                h3_conn.write_frame(ctrl, sf)
+              rescue e
+                Log.error { "Failed to initialize server control stream: #{e.message}" }
+              end
+            end
 
-        # Dispatch new client-initiated bidirectional streams (ID % 4 == 0)
-        quic_conn.streams.each do |stream_id, _stream|
-          next unless stream_id % 4 == 0
-          stream_key = {conn_key, stream_id}
-          next if handled_streams.includes?(stream_key)
-          handled_streams << stream_key
+            # Dispatch new client-initiated bidirectional streams (ID % 4 == 0)
+            quic_conn.streams.each do |stream_id, _stream|
+              next unless stream_id % 4 == 0
+              stream_key = {conn_key, stream_id}
+              next if handled_streams.includes?(stream_key)
+              handled_streams << stream_key
 
-          sock = QUIC::StreamSocket.new(quic_conn, stream_id)
-          begin
-            handle_request(h3_conn, sock)
-            Log.debug { "Handled stream #{stream_id}" }
-          rescue e
-            Log.error { "Stream #{stream_id} error: #{e.class} — #{e.message}" }
+              sock = QUIC::StreamSocket.new(quic_conn, stream_id)
+              spawn do
+                begin
+                  handle_request(h3_conn, sock)
+                  Log.debug { "Handled stream #{stream_id}" }
+                rescue e
+                  Log.error { "Stream #{stream_id} error: #{e.class} — #{e.message}" }
+                ensure
+                  event_chan.send({:send, conn_key.as(Bytes | String), client_addr})
+                end
+              end
+            end
+
+            while (n = quic_conn.send(out_buf)) > 0
+              udp.send(out_buf[0, n], client_addr)
+            end
+          elsif event_type == :send
+            conn_key = payload.as(String)
+            Log.info { "Processing send event for conn_key: #{conn_key}" }
+            if conn_tuple = connections[conn_key]?
+              quic_conn, _, _ = conn_tuple
+              sent_any = false
+              while (n = quic_conn.send(out_buf)) > 0
+                udp.send(out_buf[0, n], client_addr)
+                Log.info { "Sent #{n} bytes to #{client_addr}" }
+                sent_any = true
+              end
+              Log.info { "Send loop finished, sent_any = #{sent_any}" }
+            else
+              Log.info { "Connection not found for key: #{conn_key}" }
+            end
           end
-        end
+          nil
 
-        while (n = quic_conn.send(out_buf)) > 0
-          udp.send(out_buf[0, n], client_addr)
+        when timeout(10.milliseconds)
+          connections.each_value do |tuple|
+            quic_conn, _, client_addr = tuple
+            quic_conn.tick
+            while (n = quic_conn.send(out_buf)) > 0
+              udp.send(out_buf[0, n], client_addr)
+            end
+          end
+          nil
         end
       end
     rescue e : Exception
-      Log.error { "Server fatal error: #{e.message}" }
+      Log.error { "Server fatal error: #{e.message}\n#{e.backtrace.join("\n")}" }
     end
 
     # ------------------------------------------------------------------ Request dispatch
@@ -136,12 +201,23 @@ module H3
       req_frame = h3_conn.read_frame(stream)
       return unless req_frame.is_a?(HeadersFrame)
 
-      body = Bytes.empty
-      begin
-        nxt = h3_conn.read_frame(stream)
-        body = nxt.data if nxt.is_a?(DataFrame)
-      rescue
+      body_io = IO::Memory.new
+      loop do
+        begin
+          nxt = h3_conn.read_frame(stream)
+          if nxt.is_a?(DataFrame)
+            body_io.write(nxt.data)
+          elsif nxt.is_a?(HeadersFrame)
+            # Stop if we hit a HeadersFrame (trailers)
+            break
+          else
+            break
+          end
+        rescue
+          break
+        end
       end
+      body = body_io.to_slice
 
       if router = @router
         # ---- Mode 2: Router-based dispatch ----------------------------------

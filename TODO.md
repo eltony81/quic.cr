@@ -55,10 +55,12 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement RTT (Round Trip Time) calculation and smoothed RTT (SRTT).
   - [x] Implement PTO (Probe Timeout) timers.
   - [x] Logic to clone and retransmit lost stream/crypto frames.
+  - [x] Full ACK range processing (all ranges, not just first) per RFC 9002 Section 2.3.
 - [x] **Flow Control Enforcement**:
   - [x] Track local and remote `MAX_DATA` correctly across the connection.
   - [x] Track `MAX_STREAM_DATA` for individual streams.
   - [x] Emit `DATA_BLOCKED` and `STREAMS_BLOCKED` when hitting limits.
+  - [x] Handle `MAX_STREAMS` (0x12/0x13) and `STREAMS_BLOCKED` (0x16/0x17) frames.
 - [ ] **Connection Migration**:
   - [ ] Parse and handle `PATH_CHALLENGE` / `PATH_RESPONSE`.
   - [ ] Allow endpoint IP changes during active connections.
@@ -67,9 +69,12 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [ ] Encrypt/decrypt 0-RTT packet number spaces.
 
 ### 2. Security & Error Handling (QUIC & TLS)
-- [ ] **DDoS Mitigation (Stateless Retry)**:
-  - [ ] Parse and generate `Retry` packets.
-  - [ ] Implement cryptographically secure token generation for address validation.
+- [x] **DDoS Mitigation (Stateless Retry)**:
+  - [x] Parse and generate `Retry` packets.
+  - [x] Implement cryptographically secure token generation for address validation (HMAC-SHA256 keyed with server secret).
+  - [x] Compute Retry Integrity Tag via AES-128-GCM with RFC 9001 §5.8 fixed key/nonce.
+  - [x] Client verifies Retry Integrity Tag before accepting a Retry packet.
+  - [x] Stateless reset token uses HMAC-SHA256 with server secret (was bare SHA256).
 - [x] **Robust Error Handling**:
   - [x] Map all protocol violations to specific RFC error codes.
   - [x] Replace `raise` statements with `send_connection_close` to prevent server crashes.

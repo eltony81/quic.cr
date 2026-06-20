@@ -12,6 +12,9 @@ config = QUIC::Config.new
 config.initial_max_data = 10_000_000_u64
 config.initial_max_stream_data_bidi_local = 1_000_000_u64
 config.initial_max_stream_data_bidi_remote = 1_000_000_u64
+config.initial_max_streams_bidi = 100_u64
+config.initial_max_streams_uni = 100_u64
+config.initial_max_stream_data_uni = 1_000_000_u64
 client = QUIC::Connection.new(config, is_server: false)
 h3_client = H3::Client.new(client)
 

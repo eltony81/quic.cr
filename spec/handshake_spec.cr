@@ -60,18 +60,30 @@ describe "QUIC Handshake" do
   it "handles Retry packet and extracts token" do
     config = QUIC::Config.new
     client = QUIC::Connection.new(config, is_server: false)
-    
+
+    # Save the client's original DCID before it changes (needed for integrity tag)
+    odcid = client.initial_dcid.not_nil!
+
     # Send Initial to trigger setup
     buf = Bytes.new(2048)
     client.send(buf)
-    
-    # Construct a Retry packet from the server
+
+    # Build a Retry packet with a valid RFC 9001 §5.8 integrity tag.
     retry_token = "my_validation_token".to_slice
-    retry_tag = Bytes.new(16, 0)
-    retry_scid = "retry_scid_id".to_slice
-    
-    # Retry packet DCID is the client's SCID
-    # Retry packet SCID is the server's chosen Retry SCID
+    retry_scid  = "retry_scid_id".to_slice
+
+    # Build the packet body (without tag) so we can compute the AEAD tag over it
+    partial = IO::Memory.new
+    QUIC::RetryPacket.new(
+      0x00000001_u32,
+      client.scid.not_nil!,  # DCID in Retry = client's SCID
+      retry_scid,
+      retry_token,
+      Bytes.empty
+    ).encode_without_tag(partial)
+
+    # ODCID = client's initial DCID (what client put as DCID in its first Initial)
+    retry_tag    = QUIC::AddressValidation.retry_integrity_tag(odcid, partial.to_slice)
     retry_packet = QUIC::RetryPacket.new(
       0x00000001_u32,
       client.scid.not_nil!,
@@ -79,7 +91,7 @@ describe "QUIC Handshake" do
       retry_token,
       retry_tag
     )
-    
+
     io = IO::Memory.new
     retry_packet.encode(io)
     

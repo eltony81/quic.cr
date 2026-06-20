@@ -96,6 +96,7 @@ module QUIC
 
     @original_destination_connection_id : Bytes? = nil
     @initial_source_connection_id : Bytes? = nil
+    getter initial_dcid : Bytes? = nil
 
     @client_finished_sent = false
     @server_finished_sent = false
@@ -106,6 +107,7 @@ module QUIC
 
     @initial_handshake_bytes = IO::Memory.new
     @handshake_handshake_bytes = IO::Memory.new
+    @dcid_locked = false
 
     def initialize(@config : Config, @is_server : Bool)
       @crypto_bufs[@space_initial] = {} of UInt64 => Bytes
@@ -123,16 +125,19 @@ module QUIC
       @paths << Path.new(0)
       @recovery = @paths[0].recovery
 
-      @tls = TLS.new(@config, @is_server)
+      unless @is_server
+        @dcid = Random::Secure.random_bytes(8)
+        @initial_dcid = @dcid  # saved for Retry integrity tag verification (RFC 9001 §5.8)
+        @scid = Random::Secure.random_bytes(8)
+        setup_initial_secrets(@dcid.not_nil!)
+      end
+
+      @tls = TLS.new(@config, @is_server, @scid)
       @tls.on_secret = ->(label : String, secret : Bytes) {
         handle_secret(label, secret)
       }
       @max_data_local = @config.initial_max_data
       unless @is_server
-        @dcid = Random::Secure.random_bytes(8)
-        @scid = Random::Secure.random_bytes(8)
-        setup_initial_secrets(@dcid.not_nil!)
-        
         # Populate transport parameters for the client
         tp = TransportParameters.new
         tp.max_idle_timeout = @config.max_idle_timeout
@@ -198,6 +203,11 @@ module QUIC
         scid = Bytes.new(scid_len)
         io.read_fully(scid)
         
+        if !@is_server && !@dcid_locked
+          @dcid = scid
+          @dcid_locked = true
+        end
+        
         if !@is_server && version == 0x00000000_u32
           @version_negotiation_failed = true
           @closed = true
@@ -233,12 +243,22 @@ module QUIC
             io.read_fully(token)
             tag = Bytes.new(16)
             io.read_fully(tag)
-            
+
+            # Verify Retry Integrity Tag (RFC 9001 Section 5.8).
+            # The tag is AES-128-GCM over the pseudo-Retry packet whose AAD
+            # includes the ODCID — the DCID we chose for our very first Initial.
+            if odcid = @initial_dcid
+              unless AddressValidation.verify_retry_integrity(odcid, final_data)
+                Log.warn { "Retry packet integrity tag verification failed, ignoring" }
+                return data.size
+              end
+            end
+
             @retry_token = token
             @dcid = scid
             @space_initial = PacketNumberSpace.new
             setup_initial_secrets(scid)
-            
+
             # Re-initialize TLS to regenerate ClientHello
             @tls = TLS.new(@config, @is_server)
             @tls.on_secret = ->(label : String, secret : Bytes) {
@@ -657,6 +677,26 @@ module QUIC
         @crypto_tx_offsets[space] = offset + tls_data.size.to_u64
       end
       
+      # For client Initial packets, RFC 9000 Section 14.1 requires padding to at least 1200 bytes
+      if !@is_server && packet.is_a?(LongHeaderPacket) && packet.type == PacketType::Initial
+        payload_io = IO::Memory.new
+        packet.frames.each &.encode(payload_io)
+        payload_size = payload_io.to_slice.size
+        
+        header_io = IO::Memory.new
+        packet.encode_header(header_io)
+        VarInt.write(header_io, 1200_u64)
+        header_size = header_io.to_slice.size
+        
+        current_size = header_size + 4 + payload_size + 16
+        if current_size < 1200
+          padding_needed = 1200 - current_size
+          padding_needed.times do
+            packet.frames << PaddingFrame.new
+          end
+        end
+      end
+      
       if space.pending_ack && !space.received_pns.empty?
         largest = space.received_pns.max
         packet.frames << AckFrame.new(largest, 0_u64, 0_u64)
@@ -688,8 +728,8 @@ module QUIC
         end
         @pending_max_stream_data.clear
 
-        # 1. Drain retransmission queue
-        while !@lost_frames.empty?
+        # 1. Drain retransmission queue — one frame per send call to stay within MTU
+        if !@lost_frames.empty?
           packet.frames << @lost_frames.shift
         end
         # 2. Datagrams
@@ -761,12 +801,19 @@ module QUIC
       space.packet_number += 1
       active_path.bytes_sent += final_data.size.to_u64
       
+      if final_data.size > out_buffer.size
+        Log.error { "SEND: packet too large (#{final_data.size} bytes), dropping" }
+        return 0
+      end
       out_buffer[0, final_data.size].copy_from(final_data)
       final_data.size
     end
 
     def initial_stream_limits(stream_id : UInt64) : {UInt64, UInt64}
       bidi = (stream_id % 4 < 2)
+      # client-initiated: ID % 2 == 0. server-initiated: ID % 2 == 1.
+      # If we are server, local_initiated means ID % 2 == 1.
+      # If we are client, local_initiated means ID % 2 == 0.
       local_initiated = (stream_id % 2 == 1) == @is_server
 
       # Defaults from our own config (for local/incoming limits)

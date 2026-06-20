@@ -58,11 +58,7 @@ module H3
       elsif server_header == "quic.cr/validate-server"
         payload = Bytes[0, 0, 217, 245, 95, 77, 145, 237, 105, 136, 185, 44, 99, 184, 232, 52, 131, 73, 86, 65, 108, 238, 91, 63]
       else
-        encoded_headers = QPACK::Encoder.new.encode(@headers)
-        payload = Bytes.new(2 + encoded_headers.size)
-        payload[0] = 0_u8
-        payload[1] = 0_u8
-        encoded_headers.copy_to(payload + 2)
+        payload = QPACK::Encoder.new.encode(@headers)
       end
 
       QUIC::VarInt.write(io, type.to_u64)

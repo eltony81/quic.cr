@@ -55,11 +55,13 @@ module QUIC
         delay = VarInt.decode(io)
         count = VarInt.decode(io)
         first_range = VarInt.decode(io)
-        (0...count).each do 
-          VarInt.decode(io) # gap
-          VarInt.decode(io) # length
+        ack_ranges = [] of {UInt64, UInt64}
+        count.times do
+          gap = VarInt.decode(io)
+          len = VarInt.decode(io)
+          ack_ranges << {gap, len}
         end
-        AckFrame.new(largest, delay, first_range)
+        AckFrame.new(largest, delay, first_range, ack_ranges)
       when FrameType::MAX_DATA.to_u64
         MaxDataFrame.new(VarInt.decode(io))
       when FrameType::MAX_STREAM_DATA.to_u64
@@ -118,6 +120,10 @@ module QUIC
         DataBlockedFrame.new(VarInt.decode(io))
       when FrameType::STREAM_DATA_BLOCKED.to_u64
         StreamDataBlockedFrame.new(VarInt.decode(io), VarInt.decode(io))
+      when 0x12_u64, 0x13_u64 # MAX_STREAMS (bidi / uni)
+        MaxStreamsFrame.new(VarInt.decode(io), type_val == 0x12_u64)
+      when 0x16_u64, 0x17_u64 # STREAMS_BLOCKED (bidi / uni)
+        StreamsBlockedFrame.new(VarInt.decode(io), type_val == 0x16_u64)
       else
         raise ProtocolViolation.new("Unsupported frame type: 0x#{type_val.to_s(16)}")
       end
@@ -250,7 +256,9 @@ module QUIC
     getter largest_acknowledged : UInt64
     getter ack_delay : UInt64
     getter first_ack_range : UInt64
-    def initialize(@largest_acknowledged, @ack_delay, @first_ack_range); end
+    getter ack_ranges : Array({UInt64, UInt64})
+
+    def initialize(@largest_acknowledged, @ack_delay, @first_ack_range, @ack_ranges = [] of {UInt64, UInt64}); end
     def type : FrameType; FrameType::ACK; end
     def encode(io : IO)
       VarInt.write(io, type.to_u64)
@@ -258,6 +266,28 @@ module QUIC
       VarInt.write(io, @ack_delay)
       VarInt.write(io, 0_u64)
       VarInt.write(io, @first_ack_range)
+    end
+  end
+
+  class MaxStreamsFrame < Frame
+    getter maximum_streams : UInt64
+    getter bidirectional : Bool
+    def initialize(@maximum_streams, @bidirectional); end
+    def type : FrameType; FrameType::MAX_STREAMS; end
+    def encode(io : IO)
+      VarInt.write(io, @bidirectional ? 0x12_u64 : 0x13_u64)
+      VarInt.write(io, @maximum_streams)
+    end
+  end
+
+  class StreamsBlockedFrame < Frame
+    getter maximum_streams : UInt64
+    getter bidirectional : Bool
+    def initialize(@maximum_streams, @bidirectional); end
+    def type : FrameType; FrameType::STREAMS_BLOCKED; end
+    def encode(io : IO)
+      VarInt.write(io, @bidirectional ? 0x16_u64 : 0x17_u64)
+      VarInt.write(io, @maximum_streams)
     end
   end
 

@@ -91,9 +91,13 @@ module QUIC
       io.write @scid
     end
 
-    def encode(io : IO)
+    def encode_without_tag(io : IO)
       encode_header(io)
       io.write @token
+    end
+
+    def encode(io : IO)
+      encode_without_tag(io)
       io.write @tag
     end
   end

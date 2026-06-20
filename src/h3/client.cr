@@ -29,7 +29,8 @@ module H3
       # Wait for handshake completion or timeout
       select
       when @quic_conn.handshake_chan.receive
-      when timeout(500.milliseconds)
+      when timeout(5.seconds)
+        raise "QUIC handshake timed out"
       end
       @connected = true
       
@@ -134,7 +135,9 @@ module H3
             has_body = true
             resp_body.write(f.data)
           end
-        rescue
+        rescue e
+          STDERR.puts "Frame decode error: #{e.class} - #{e.message}"
+          STDERR.puts e.backtrace.join("\n")
           break
         end
       end

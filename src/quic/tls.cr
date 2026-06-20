@@ -151,7 +151,7 @@ module QUIC
     getter is_server : Bool
     property on_secret : Proc(String, Bytes, Nil)?
 
-    def initialize(@config : Config, @is_server : Bool)
+    def initialize(@config : Config, @is_server : Bool, scid : Bytes? = nil)
       method = LibSSL.tls_method
       @ssl_ctx = LibSSL.ssl_ctx_new(method)
       LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MIN_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
@@ -171,6 +171,7 @@ module QUIC
       tp.initial_max_stream_data_uni = @config.initial_max_stream_data_uni
       tp.initial_max_streams_bidi = @config.initial_max_streams_bidi
       tp.initial_max_streams_uni = @config.initial_max_streams_uni
+      tp.initial_source_connection_id = scid if scid
       
       io = IO::Memory.new
       tp.encode(io)

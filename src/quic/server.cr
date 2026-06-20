@@ -81,9 +81,15 @@ module QUIC
               if @require_address_validation
                 if token.empty? || !AddressValidation.validate_token(token, client_addr.ip.address)
                   retry_scid = Random::Secure.random_bytes(8)
-                  new_token = AddressValidation.generate_token(client_addr.ip.address)
-                  retry_tag = Random::Secure.random_bytes(16)
-                  
+                  new_token  = AddressValidation.generate_token(client_addr.ip.address)
+
+                  # Build the Retry packet body (without tag) so we can compute the
+                  # RFC 9001 Section 5.8 AES-128-GCM integrity tag over it.
+                  partial_io = IO::Memory.new
+                  RetryPacket.new(version, scid, retry_scid, new_token, Bytes.empty).encode_without_tag(partial_io)
+                  # ODCID = dcid (original destination connection ID from client's first Initial)
+                  retry_tag = AddressValidation.retry_integrity_tag(dcid, partial_io.to_slice)
+
                   retry_packet = RetryPacket.new(version, scid, retry_scid, new_token, retry_tag)
                   out_buf = IO::Memory.new
                   retry_packet.encode(out_buf)
