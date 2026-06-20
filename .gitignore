@@ -10,3 +10,16 @@
 
 /dev_tools/
 /venv/
+
+# Examples built binaries
+/examples/h3_client
+/examples/h3_server
+/examples/h3_server_routed
+/examples/http3_client
+/examples/http3_server
+/examples/debug_server
+
+# Keys & Certificates
+cert.pem
+key.pem
+*.log
