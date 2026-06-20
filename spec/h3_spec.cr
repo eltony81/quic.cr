@@ -1,0 +1,121 @@
+require "./spec_helper"
+
+class MockSocket < IO
+  getter read_io : IO::Memory
+  getter write_io : IO::Memory
+
+  def initialize(read_bytes : Bytes = Bytes.empty)
+    @read_io = IO::Memory.new(read_bytes)
+    @write_io = IO::Memory.new
+  end
+
+  def read(slice : Bytes) : Int32
+    @read_io.read(slice)
+  end
+
+  def write(slice : Bytes) : Nil
+    @write_io.write(slice)
+    nil
+  end
+end
+
+describe H3 do
+  it "supports QPACK encoding and decoding" do
+    headers = {
+      ":method" => "GET",
+      ":path" => "/index.html",
+      "user-agent" => "quic.cr/h3",
+    }
+    encoded = H3::QPACK::Encoder.new.encode(headers)
+    decoded = H3::QPACK::Decoder.new.decode(encoded)
+    decoded.should eq(headers)
+  end
+
+  it "serializes and deserializes HTTP/3 frames" do
+    # DataFrame
+    data_frame = H3::DataFrame.new("hello world".to_slice)
+    io = IO::Memory.new
+    data_frame.encode(io)
+    io.rewind
+    decoded_data = H3::Frame.decode(io)
+    decoded_data.should be_a(H3::DataFrame)
+    if decoded_data.is_a?(H3::DataFrame)
+      String.new(decoded_data.data).should eq("hello world")
+    end
+
+    # HeadersFrame
+    headers = {":status" => "200", "content-type" => "text/plain"}
+    headers_frame = H3::HeadersFrame.new(headers)
+    io2 = IO::Memory.new
+    headers_frame.encode(io2)
+    io2.rewind
+    decoded_headers = H3::Frame.decode(io2)
+    decoded_headers.should be_a(H3::HeadersFrame)
+    if decoded_headers.is_a?(H3::HeadersFrame)
+      decoded_headers.headers.should eq(headers)
+    end
+
+    # SettingsFrame
+    settings_frame = H3::SettingsFrame.new
+    settings_frame.settings[1_u64] = 4096_u64
+    io3 = IO::Memory.new
+    settings_frame.encode(io3)
+    io3.rewind
+    decoded_settings = H3::Frame.decode(io3)
+    decoded_settings.should be_a(H3::SettingsFrame)
+    if decoded_settings.is_a?(H3::SettingsFrame)
+      decoded_settings.settings[1_u64].should eq(4096_u64)
+    end
+  end
+
+  it "performs an end-to-end request-response flow" do
+    config = QUIC::Config.new
+    # Let's mock/use H3::Connection directly or H3::Client if we want. But the spec tests H3::Client and H3::Server request-response flow.
+    # H3::Client.new expects (host, port, config) and starts a real socket loop.
+    # If we want a unit/mock test of the end-to-end request-response flow without real UDP sockets, we can do it directly with H3::Connection.
+    # Let's see: we have quic_client and quic_server.
+    quic_client = QUIC::Connection.new(config, is_server: false)
+    quic_server = QUIC::Connection.new(config, is_server: true)
+    
+    h3_client_conn = H3::Connection.new(quic_client)
+    h3_server = H3::Server.new do |headers, body|
+      headers[":path"].should eq("/greet")
+      String.new(body).should eq("client message")
+      
+      resp_headers = {
+        ":status" => "200",
+        "content-type" => "text/plain",
+      }
+      {resp_headers, "hello from server".to_slice}
+    end
+
+    # 1. Client serializes request to client socket
+    client_socket = MockSocket.new
+    h3_client_conn.write_frame(client_socket, H3::HeadersFrame.new({":path" => "/greet"}))
+    h3_client_conn.write_frame(client_socket, H3::DataFrame.new("client message".to_slice))
+    
+    # Get the payload sent by the client
+    client_payload = client_socket.write_io.to_slice
+    
+    # 2. Server reads client payload and writes response
+    server_socket = MockSocket.new(client_payload)
+    h3_server.handle_request(h3_client_conn, server_socket)
+    
+    # Get the payload sent by the server
+    server_payload = server_socket.write_io.to_slice
+    
+    # 3. Client processes server response
+    final_socket = MockSocket.new(server_payload)
+    resp_headers_frame = h3_client_conn.read_frame(final_socket)
+    resp_headers_frame.should be_a(H3::HeadersFrame)
+    
+    # Read the data frame
+    resp_data_frame = h3_client_conn.read_frame(final_socket)
+    resp_data_frame.should be_a(H3::DataFrame)
+    
+    if resp_headers_frame.is_a?(H3::HeadersFrame) && resp_data_frame.is_a?(H3::DataFrame)
+      resp_headers_frame.headers[":status"].should eq("200")
+      String.new(resp_data_frame.data).should eq("hello from server")
+    end
+  end
+end

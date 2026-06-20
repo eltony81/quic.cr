@@ -1,0 +1,9 @@
+name: quic
+version: 0.1.0
+
+authors:
+  - tony <antonio.difluri@gmail.com>
+
+crystal: '>= 1.20.2'
+
+license: MIT
