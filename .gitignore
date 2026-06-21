@@ -23,3 +23,7 @@
 cert.pem
 key.pem
 *.log
+benchmark/crystal_server
+benchmark/go_server
+benchmark/results/
+benchmark/*_bench.log
