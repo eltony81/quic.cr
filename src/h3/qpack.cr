@@ -65,113 +65,126 @@ module H3
       getter dynamic_table = DynamicTable.new
       getter encoder_stream_io = IO::Memory.new
 
+      # Encodes a set of headers into a QPACK field section (RFC 9204 Section 4.5).
+      #
+      # Two-pass design: first insert all novel headers into the dynamic table,
+      # then encode the header block using the final insert_count as the base.
+      # This ensures relative indices are correct even when multiple novel headers
+      # appear in the same call.
       def encode(headers : Hash(String, String)) : Bytes
-        io = IO::Memory.new
-        
-        # Calculate insert count
-        inserted = 0
-        
+        # ----- Pass 1: insert novel headers into the dynamic table -----
         headers.each do |k, v|
-          exact_match_idx = nil
-          name_match_idx = nil
-          is_static_exact = false
-          is_static_name = false
-          
-          # Search Dynamic Table
-          @dynamic_table.entries.each_with_index do |entry, idx|
-            if entry.name == k
-              name_match_idx = idx unless name_match_idx
-              if entry.value == v
-                exact_match_idx = idx
-                break
-              end
-            end
-          end
-          
-          # Search Static Table (only if no exact match in dynamic table)
-          if !exact_match_idx
-            STATIC_TABLE.each_with_index do |entry, idx|
-              if entry[0] == k
-                if !name_match_idx
-                  name_match_idx = idx
-                  is_static_name = true
-                end
-                if entry[1] == v
-                  exact_match_idx = idx
-                  is_static_exact = true
-                  break
-                end
-              end
-            end
-          end
-          
-          if idx = exact_match_idx
-            if is_static_exact
-              # Indexed Field Line - Static
-              Integer.encode(io, idx.to_u64, 6, 0xC0_u8)
-            else
-              # Indexed Field Line - Dynamic (Relative Index)
-              # For simplicity, base == insert_count, so relative = Base - 1 - Absolute = @insert_count - 1 - (@dropped_count + idx)
-              abs_idx = @dynamic_table.dropped_count + idx.to_u64
-              rel_idx = @dynamic_table.insert_count - 1 - abs_idx
-              Integer.encode(io, rel_idx, 6, 0x80_u8)
-            end
+          next if find_static_exact(k, v)
+          next if @dynamic_table.entries.any? { |e| e.name == k && e.value == v }
+          next if @dynamic_table.capacity == 0
+
+          static_name_idx, dyn_name_idx = find_name_match(k)
+
+          if s_idx = static_name_idx
+            Integer.encode(@encoder_stream_io, s_idx.to_u64, 6, 0xC0_u8)
+            encode_string(@encoder_stream_io, v, 7)
+          elsif d_idx = dyn_name_idx
+            Integer.encode(@encoder_stream_io, d_idx.to_u64, 6, 0x80_u8)
+            encode_string(@encoder_stream_io, v, 7)
           else
-            # No exact match. Let's insert it into the dynamic table to save space later!
-            if @dynamic_table.capacity > 0
-              if idx = name_match_idx
-                # Insert With Name Reference
-                is_static = is_static_name
-                flags = is_static ? 0xC0_u8 : 0x80_u8
-                Integer.encode(@encoder_stream_io, idx.to_u64, 6, flags)
-                encode_string(@encoder_stream_io, v, 7)
-              else
-                # Insert Without Name Reference
-                encode_string(@encoder_stream_io, k, 5, 0x40_u8)
-                encode_string(@encoder_stream_io, v, 7)
-              end
-              @dynamic_table.add(k, v)
-              inserted += 1
-              
-              # Now reference the newly inserted item using Indexed Field Line
-              rel_idx = 0_u64 # It's the most recent item, so relative idx = 0
-              Integer.encode(io, rel_idx, 6, 0x80_u8)
+            encode_string(@encoder_stream_io, k, 5, 0x40_u8)
+            encode_string(@encoder_stream_io, v, 7)
+          end
+          @dynamic_table.add(k, v)
+        end
+
+        # Final insert count after all insertions — used as the header block base.
+        final_ic = @dynamic_table.insert_count
+
+        # ----- Pass 2: build the header block -----
+        fields_io = IO::Memory.new
+
+        headers.each do |k, v|
+          if s_idx = find_static_exact(k, v)
+            # Indexed Field Line – Static
+            Integer.encode(fields_io, s_idx.to_u64, 6, 0xC0_u8)
+          elsif d_idx = find_dynamic_exact(k, v)
+            # Indexed Field Line – Dynamic
+            # d_idx is the deque position; absolute index = dropped_count + d_idx
+            abs_idx = @dynamic_table.dropped_count + d_idx.to_u64
+            rel_idx = final_ic - 1 - abs_idx
+            Integer.encode(fields_io, rel_idx, 6, 0x80_u8)
+          else
+            # Literal (capacity was 0, so we couldn't insert)
+            _, static_name_idx_for_lit = find_name_match(k)
+            dyn_name_for_lit, _ = find_name_match_dyn(k)
+            if s_idx = find_static_name_only(k)
+              Integer.encode(fields_io, s_idx.to_u64, 4, 0x50_u8)
+              encode_string(fields_io, v, 7)
             else
-              # Cannot insert, use Literal Field Line
-              if idx = name_match_idx
-                if is_static_name
-                  Integer.encode(io, idx.to_u64, 4, 0x50_u8)
-                else
-                  # Literal with Name Ref - Dynamic (Relative Index)
-                  abs_idx = @dynamic_table.dropped_count + idx.to_u64
-                  rel_idx = @dynamic_table.insert_count - 1 - abs_idx
-                  Integer.encode(io, rel_idx, 4, 0x40_u8)
-                end
-                encode_string(io, v, 7)
-              else
-                # Literal Without Name Ref
-                encode_string(io, k, 3, 0x20_u8)
-                encode_string(io, v, 7)
-              end
+              encode_string(fields_io, k, 3, 0x20_u8)
+              encode_string(fields_io, v, 7)
             end
           end
         end
-        
-        # Now prepend RIC and Base
-        final_io = IO::Memory.new
-        # RIC = @dynamic_table.insert_count (simplified max entries % 256)
-        # Assuming ric fits in 8 bits for now
-        ric = @dynamic_table.insert_count % 256
-        Integer.encode(final_io, ric.to_u64, 8, 0x00_u8)
-        # Base Delta = 0 (Base == RIC), Sign = 0
-        final_io.write_byte 0x00_u8
-        
-        final_io.write io.to_slice
-        final_io.to_slice
+
+        # Header block prefix: RIC + Base (RFC 9204 Section 4.5.1)
+        # RIC = 0 means no dynamic references; RIC = final_ic means all are pre-base.
+        # Base Delta = 0 (Base == RIC), Sign = 0.
+        prefix_io = IO::Memory.new
+        ric = final_ic % 256
+        Integer.encode(prefix_io, ric.to_u64, 8, 0x00_u8)
+        prefix_io.write_byte 0x00_u8
+
+        result = IO::Memory.new
+        result.write prefix_io.to_slice
+        result.write fields_io.to_slice
+        result.to_slice
       end
-      
+
+      private def find_static_exact(k : String, v : String) : Int32?
+        STATIC_TABLE.each_with_index do |entry, idx|
+          return idx if entry[0] == k && entry[1] == v
+        end
+        nil
+      end
+
+      private def find_dynamic_exact(k : String, v : String) : Int32?
+        @dynamic_table.entries.each_with_index do |entry, idx|
+          return idx if entry.name == k && entry.value == v
+        end
+        nil
+      end
+
+      # Returns {static_idx, dynamic_idx} for name-only matches (nil if no match).
+      private def find_name_match(k : String) : {Int32?, Int32?}
+        s_idx = nil
+        STATIC_TABLE.each_with_index do |entry, idx|
+          if entry[0] == k
+            s_idx = idx
+            break
+          end
+        end
+        d_idx = nil
+        @dynamic_table.entries.each_with_index do |entry, idx|
+          if entry.name == k
+            d_idx = idx
+            break
+          end
+        end
+        {s_idx, d_idx}
+      end
+
+      private def find_name_match_dyn(k : String) : {Int32?, Nil}
+        @dynamic_table.entries.each_with_index do |entry, idx|
+          return {idx, nil} if entry.name == k
+        end
+        {nil, nil}
+      end
+
+      private def find_static_name_only(k : String) : Int32?
+        STATIC_TABLE.each_with_index do |entry, idx|
+          return idx if entry[0] == k
+        end
+        nil
+      end
+
       private def encode_string(io : IO, str : String, prefix_len : Int32, flags : UInt8 = 0_u8)
-        # Without Huffman.encode, we send raw strings (H=0).
         Integer.encode(io, str.bytesize.to_u64, prefix_len, flags)
         io.write str.to_slice
       end

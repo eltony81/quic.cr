@@ -70,8 +70,9 @@ module QUIC
     end
 
     @pending_path_responses = [] of Bytes
-    @pending_path_challenges = [] of Bytes
-    @path_validated = false
+    @pending_path_challenges = [] of Bytes     # queued to send as PATH_CHALLENGE
+    @outstanding_path_challenges = Set(String).new  # sent, awaiting PATH_RESPONSE
+    getter? path_validated : Bool = false
 
     property? version_negotiation_failed : Bool = false
     @retry_token : Bytes = Bytes.empty
@@ -453,6 +454,14 @@ module QUIC
           stream.update_max_stream_data_local(stream.max_stream_data_local + 1048576_u64)
           @pending_max_stream_data << frame.stream_id
         end
+      when PathChallengeFrame
+        # RFC 9000 §8.2.1: echo the same 8 bytes in a PATH_RESPONSE
+        @pending_path_responses << frame.data
+      when PathResponseFrame
+        # RFC 9000 §8.2.2: validate path if data matches an outstanding challenge
+        if @outstanding_path_challenges.delete(frame.data.hexstring)
+          @path_validated = true
+        end
       when ConnectionCloseFrame
         Log.trace { "RECV ConnectionCloseFrame: error_code=0x#{frame.error_code.to_s(16)} reason=#{frame.reason}" }
         @closed = true
@@ -532,6 +541,16 @@ module QUIC
       @closed = true
       @close_error = error_code
       @close_reason = reason
+    end
+
+    # Queue a PATH_CHALLENGE to validate a new or migrated path (RFC 9000 §8.2).
+    # Returns the 8-byte challenge data; path is considered validated when we
+    # receive a matching PATH_RESPONSE.
+    def initiate_path_validation : Bytes
+      challenge = Random::Secure.random_bytes(8)
+      @pending_path_challenges << challenge
+      @path_validated = false
+      challenge
     end
 
     def send(out_buffer : Bytes) : Int32
@@ -617,7 +636,7 @@ module QUIC
         tls_data = nil
       end
 
-      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @lost_frames.empty?
+      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @pending_path_challenges.empty? && @lost_frames.empty?
         Log.trace { "SEND DEBUG: return 0 (no tls_data, no ack, no stream data, no lost frames)" }
         return 0
       end
@@ -662,6 +681,14 @@ module QUIC
       if @closed && !@close_sent
         packet.frames << ConnectionCloseFrame.new(@close_error, 0_u64, @close_reason)
         @close_sent = true
+      end
+
+      unless @pending_path_challenges.empty?
+        @pending_path_challenges.each do |data|
+          packet.frames << PathChallengeFrame.new(data)
+          @outstanding_path_challenges.add(data.hexstring)
+        end
+        @pending_path_challenges.clear
       end
 
       unless @pending_path_responses.empty?

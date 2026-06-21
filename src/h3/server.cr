@@ -77,16 +77,20 @@ module H3
       
       event_chan = Channel(Tuple(Symbol, Bytes | String, Socket::IPAddress)).new(1000)
 
+      buf_pool = QUIC::BufferPool.new
+
       # Spawn background receiver fiber
       spawn do
-        buf = Bytes.new(65536)
         loop do
+          buf = buf_pool.lease
           begin
             size, client_addr = udp.receive(buf)
-            packet_data = Bytes.new(size)
-            buf[0, size].copy_to(packet_data)
+            # Copy only the received bytes; return the leased buffer immediately
+            packet_data = buf[0, size].dup
+            buf_pool.return(buf)
             event_chan.send({:packet, packet_data.as(Bytes | String), client_addr})
           rescue e
+            buf_pool.return(buf)
             break if udp.closed?
           end
         end
@@ -112,7 +116,14 @@ module H3
               connections[conn_key] = conn_tuple
             end
 
-            quic_conn, h3_conn, _ = conn_tuple
+            quic_conn, h3_conn, prev_addr = conn_tuple
+
+            # RFC 9000 §9: detect connection migration (peer address change)
+            if prev_addr != client_addr && quic_conn.handshake_complete?
+              Log.info { "Connection migration: #{prev_addr} → #{client_addr}" }
+              quic_conn.initiate_path_validation
+            end
+
             # Update current remote address in connection tuple
             conn_tuple = {quic_conn, h3_conn, client_addr}
             connections[conn_key] = conn_tuple
@@ -125,13 +136,14 @@ module H3
               connections[scid.hexstring] = conn_tuple
             end
 
-            # Send control settings stream upon handshake completion
+            # Send control, QPACK encoder, and decoder streams upon handshake completion
             if !was_completed && quic_conn.handshake_complete?
               begin
                 ctrl = h3_conn.open_uni_stream(0_u64)
                 sf   = H3::SettingsFrame.new
                 sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 100_u64, 0x06_u64 => 100_u64}
                 h3_conn.write_frame(ctrl, sf)
+                h3_conn.open_qpack_streams
               rescue e
                 Log.error { "Failed to initialize server control stream: #{e.message}" }
               end

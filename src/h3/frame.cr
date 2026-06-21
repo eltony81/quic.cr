@@ -51,16 +51,7 @@ module H3
     def type : FrameType; FrameType::HEADERS; end
     
     def encode(io : IO)
-      server_header = @headers["server"]?
-      
-      if server_header == "quic.cr/http3-server"
-        payload = Bytes[0, 0, 217, 245, 95, 77, 143, 237, 105, 136, 185, 44, 98, 116, 166, 182, 86, 65, 108, 238, 91, 63]
-      elsif server_header == "quic.cr/validate-server"
-        payload = Bytes[0, 0, 217, 245, 95, 77, 145, 237, 105, 136, 185, 44, 99, 184, 232, 52, 131, 73, 86, 65, 108, 238, 91, 63]
-      else
-        payload = QPACK::Encoder.new.encode(@headers)
-      end
-
+      payload = QPACK::Encoder.new.encode(@headers)
       QUIC::VarInt.write(io, type.to_u64)
       QUIC::VarInt.write(io, payload.size.to_u64)
       io.write payload
@@ -68,10 +59,10 @@ module H3
   end
 
   abstract class Frame
-    def self.decode(io : IO) : Frame
+    def self.decode(io : IO, qpack_decoder : QPACK::Decoder? = nil) : Frame
       type_val = QUIC::VarInt.decode(io)
       length = QUIC::VarInt.decode(io)
-      
+
       case type_val
       when FrameType::DATA.to_u64
         buf = Bytes.new(length)
@@ -80,7 +71,7 @@ module H3
       when FrameType::HEADERS.to_u64
         buf = Bytes.new(length)
         io.read_fully(buf)
-        headers = QPACK::Decoder.new.decode(buf)
+        headers = (qpack_decoder || QPACK::Decoder.new).decode(buf)
         HeadersFrame.new(headers)
       when FrameType::SETTINGS.to_u64
         settings = {} of UInt64 => UInt64

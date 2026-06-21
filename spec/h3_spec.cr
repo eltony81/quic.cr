@@ -31,6 +31,75 @@ describe H3 do
     decoded.should eq(headers)
   end
 
+  it "persistent QPACK encoder/decoder preserves headers across multiple calls" do
+    # With a persistent encoder+decoder pair (same dynamic table state on both sides),
+    # multiple rounds of encode/decode must produce consistent results.
+    encoder = H3::QPACK::Encoder.new
+    decoder = H3::QPACK::Decoder.new
+
+    headers = {":status" => "200", "content-type" => "application/json", "x-custom" => "roundtrip-value"}
+
+    # Encode twice and decode both; decoder must correctly resolve all references
+    (1..3).each do
+      encoded = encoder.encode(headers)
+      # Simulate receiving encoder stream instructions at the decoder
+      instr = encoder.encoder_stream_io.to_slice.dup
+      encoder.encoder_stream_io.clear
+      encoder.encoder_stream_io.rewind
+      if instr.size > 0
+        H3::QPACK::InstructionDecoder.new(decoder.dynamic_table).decode(IO::Memory.new(instr))
+      end
+      decoded = decoder.decode(encoded)
+      decoded.should eq(headers)
+    end
+  end
+
+  it "dynamic table reduces encoding size vs. all-literal encoding" do
+    # Novel headers (not in static table) are encoded as literals when the dynamic
+    # table has zero capacity, but as compact indexed references when capacity > 0.
+    novel_headers = {"x-trace-id" => "abcdef1234567890", "x-region" => "us-east-1"}
+
+    # With capacity = 0 (default): encoder falls back to literal field lines
+    literal_encoder = H3::QPACK::Encoder.new  # capacity = 0 by default
+    literal_encoded = literal_encoder.encode(novel_headers)
+
+    # With capacity > 0: encoder inserts into dynamic table and uses indexed refs
+    dynamic_encoder = H3::QPACK::Encoder.new
+    dynamic_encoder.dynamic_table.set_capacity(4096_u64)
+    dynamic_decoder = H3::QPACK::Decoder.new
+    dynamic_decoder.dynamic_table.set_capacity(4096_u64)
+    dynamic_encoded = dynamic_encoder.encode(novel_headers)
+
+    # Process encoder stream instructions before decoding
+    instr = dynamic_encoder.encoder_stream_io.to_slice.dup
+    dynamic_encoder.encoder_stream_io.clear
+    dynamic_encoder.encoder_stream_io.rewind
+    H3::QPACK::InstructionDecoder.new(dynamic_decoder.dynamic_table).decode(IO::Memory.new(instr))
+
+    decoded = dynamic_decoder.decode(dynamic_encoded)
+    decoded.should eq(novel_headers)
+
+    # Dynamic encoding must be more compact than all-literal encoding
+    dynamic_encoded.size.should be < literal_encoded.size
+  end
+
+  it "Frame.decode uses provided QPACK decoder" do
+    headers = {":status" => "200", "content-type" => "text/plain"}
+    encoder = H3::QPACK::Encoder.new
+    decoder = H3::QPACK::Decoder.new
+
+    payload = encoder.encode(headers)
+    io = IO::Memory.new
+    QUIC::VarInt.write(io, H3::FrameType::HEADERS.to_u64)
+    QUIC::VarInt.write(io, payload.size.to_u64)
+    io.write(payload)
+    io.rewind
+
+    frame = H3::Frame.decode(io, decoder)
+    frame.should be_a(H3::HeadersFrame)
+    frame.as(H3::HeadersFrame).headers.should eq(headers)
+  end
+
   it "serializes and deserializes HTTP/3 frames" do
     # DataFrame
     data_frame = H3::DataFrame.new("hello world".to_slice)

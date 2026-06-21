@@ -61,9 +61,11 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Track `MAX_STREAM_DATA` for individual streams.
   - [x] Emit `DATA_BLOCKED` and `STREAMS_BLOCKED` when hitting limits.
   - [x] Handle `MAX_STREAMS` (0x12/0x13) and `STREAMS_BLOCKED` (0x16/0x17) frames.
-- [ ] **Connection Migration**:
-  - [ ] Parse and handle `PATH_CHALLENGE` / `PATH_RESPONSE`.
-  - [ ] Allow endpoint IP changes during active connections.
+- [x] **Connection Migration**:
+  - [x] Parse and handle `PATH_CHALLENGE` / `PATH_RESPONSE` in `handle_frame`.
+  - [x] Drain `@pending_path_challenges` in `send()` → emits `PathChallengeFrame`.
+  - [x] `initiate_path_validation()` queues a random 8-byte challenge; `path_validated?` tracks outcome.
+  - [x] `H3::Server.listen` detects peer address change and triggers path validation automatically.
 - [ ] **0-RTT (Early Data)**:
   - [ ] Save/restore session tickets and early data parameters.
   - [ ] Encrypt/decrypt 0-RTT packet number spaces.
@@ -85,10 +87,14 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement Huffman String Encoding/Decoding.
   - [x] Implement 99-element Static Table resolution.
   - [x] Parse Header Block Prefix and decode Field Lines (Static/Literal).
-- [ ] **Dynamic QPACK Implementation** (Deferred):
-  - [ ] Build QPACK Encoder and Decoder streams.
-  - [ ] Support dynamic table insertion and eviction.
-  - [ ] Handle blocked streams awaiting dynamic table synchronization.
+- [x] **Dynamic QPACK Implementation**:
+  - [x] Persistent `QPACK::Encoder` and `QPACK::Decoder` per `H3::Connection` (connection-scoped dynamic table).
+  - [x] Two-pass encoder: pre-insert all novel headers, then encode with correct relative indices (fixed per-call rel_idx=0 bug).
+  - [x] Open QPACK encoder stream (type=2) and decoder stream (type=3) on handshake completion.
+  - [x] `H3::Connection.write_frame` flushes encoder stream instructions before each HEADERS frame.
+  - [x] `Frame.decode` accepts optional `QPACK::Decoder` parameter for persistent decoding.
+  - [ ] Handle blocked streams awaiting dynamic table synchronization (RFC 9204 §2.1.1).
+  - [ ] Decoder acknowledgment stream (decoder sends Insert Count Increment / Stream Cancellation).
 - [x] **HTTP/3 Client API**:
   - [x] Build `H3::Client` abstraction akin to `HTTP::Client`.
   - [x] Implement `get`, `post`, and other standard HTTP methods.
@@ -104,7 +110,7 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
 - [ ] **Fiber-based Concurrency**: 
   - [x] Refactor UDP listener into a dedicated network thread/loop.
   - [x] Dispatch connection handling via channels and `spawn` blocks.
-- [ ] **Zero-Copy Memory Allocation**:
-  - [ ] Implement a custom `BufferPool` to avoid native GC allocations.
-  - [ ] Read directly into reusable slices.
-  - [ ] Optimize AEAD functions to process buffers in-place without `.dup`.
+- [x] **Zero-Copy Memory Allocation**:
+  - [x] Implement `QUIC::BufferPool` — thread-safe pool of reusable `Bytes` slices (lease/return/borrow).
+  - [x] `H3::Server.listen` receiver fiber leases a buffer per packet and returns it immediately after copy.
+  - [ ] Optimize AEAD functions to process buffers in-place without `.dup` (future work).
