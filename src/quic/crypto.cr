@@ -18,12 +18,29 @@ class OpenSSL::Cipher
     nil
   end
 
+  # Writes encrypted/decrypted output directly into `output` (zero-copy variant).
+  # Returns the number of bytes written.
+  def update_into(plaintext : Bytes, output : Bytes) : Int32
+    out_len = 0
+    if LibCrypto.evp_cipherupdate(@ctx, output.to_unsafe, pointerof(out_len), plaintext.to_unsafe, plaintext.size) != 1
+      raise Error.new "EVP_CipherUpdate"
+    end
+    out_len
+  end
+
   def gcm_get_tag : Bytes
     tag = Bytes.new(16)
     if LibCrypto.evp_cipher_ctx_ctrl(@ctx, LibCrypto::EVP_CTRL_GCM_GET_TAG, 16, tag) != 1
       raise Error.new "EVP_CIPHER_CTX_ctrl (GET_TAG)"
     end
     tag
+  end
+
+  # Writes the 16-byte GCM authentication tag directly into `output[off, 16]`.
+  def gcm_get_tag_into(output : Bytes, off : Int32 = 0)
+    if LibCrypto.evp_cipher_ctx_ctrl(@ctx, LibCrypto::EVP_CTRL_GCM_GET_TAG, 16, output[off, 16].to_unsafe) != 1
+      raise Error.new "EVP_CIPHER_CTX_ctrl (GET_TAG)"
+    end
   end
 
   def gcm_set_tag(tag : Bytes)
@@ -40,54 +57,62 @@ module QUIC
     class AEAD
       @key : Bytes
       @iv : Bytes
+      # Reusable nonce buffer — reset from @iv before each encrypt/decrypt.
+      # Safe because QUIC send/recv runs in a single fiber at a time.
+      @nonce : Bytes
 
       def initialize(@key, @iv)
+        @nonce = @iv.dup
       end
 
+      # Encrypts plaintext and returns ciphertext + 16-byte GCM tag in a single
+      # pre-allocated buffer (1 alloc instead of 4+ intermediate concatenations).
       def encrypt(ad : Bytes, pn : UInt64, plaintext : Bytes) : Bytes
-        nonce = build_nonce(pn)
+        build_nonce(pn)
         cipher = OpenSSL::Cipher.new("AES-128-GCM")
         cipher.encrypt
         cipher.key = @key
-        cipher.iv = nonce
+        cipher.iv = @nonce
         cipher.update_ad(ad)
-        
-        ciphertext = cipher.update(plaintext)
-        ciphertext += cipher.final
-        
-        tag = cipher.gcm_get_tag
-        ciphertext + tag
+
+        result = Bytes.new(plaintext.size + 16)
+        n = cipher.update_into(plaintext, result)
+        cipher.final  # GCM finalization — produces no extra bytes
+        cipher.gcm_get_tag_into(result, n)
+        result
       end
 
+      # Decrypts ciphertext (last 16 bytes = GCM tag) into a single pre-allocated
+      # plaintext buffer (1 alloc instead of 4+ intermediate concatenations).
       def decrypt(ad : Bytes, pn : UInt64, ciphertext : Bytes) : Bytes
-        nonce = build_nonce(pn)
         tag_size = 16
         raise Error.new("Ciphertext too short") if ciphertext.size < tag_size
-        
-        actual_ciphertext = ciphertext[0...-tag_size]
-        tag = ciphertext[-tag_size..-1]
+
+        build_nonce(pn)
+        actual_ct = ciphertext[0, ciphertext.size - tag_size]
+        tag       = ciphertext[ciphertext.size - tag_size, tag_size]
 
         cipher = OpenSSL::Cipher.new("AES-128-GCM")
         cipher.decrypt
         cipher.key = @key
-        cipher.iv = nonce
+        cipher.iv = @nonce
         cipher.update_ad(ad)
         cipher.gcm_set_tag(tag)
-        
-        plaintext = cipher.update(actual_ciphertext)
-        plaintext + cipher.final
+
+        result = Bytes.new(actual_ct.size)
+        n = cipher.update_into(actual_ct, result)
+        cipher.final
+        result[0, n]
       rescue e : OpenSSL::Cipher::Error
         raise InternalError.new("Decryption failed: #{e.message}")
       end
 
-      private def build_nonce(pn : UInt64) : Bytes
-        nonce = @iv.dup
+      private def build_nonce(pn : UInt64)
+        @iv.copy_to(@nonce)
         (0..7).each do |i|
-          idx = nonce.size - 1 - i
-          val = ((pn >> (i * 8)) & 0xff).to_u8
-          nonce[idx] ^= val
+          idx = @nonce.size - 1 - i
+          @nonce[idx] ^= ((pn >> (i * 8)) & 0xff).to_u8
         end
-        nonce
       end
     end
 

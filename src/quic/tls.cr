@@ -185,6 +185,11 @@ module QUIC
         res2 = LibSSL.ssl_ctx_use_privatekey_file(@ssl_ctx, @config.key_file, LibSSL::SSLFileType::PEM)
         Log.trace { "TLS SERVER INITIALIZATION: cert_load=#{res1}, key_load=#{res2}" }
         LibSSL.ssl_ctx_set_alpn_select_cb(@ssl_ctx, ->QUIC.alpn_select_cb, nil)
+        # Enable TLS 1.3 session tickets with 0-RTT support (RFC 9001 §4.6)
+        LibSSL.SSL_CTX_set_max_early_data(@ssl_ctx, 0xffffffff_u32)
+        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_SERVER, nil)
+      else
+        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_CLIENT, nil)
       end
 
       @ssl = LibSSL.ssl_new(@ssl_ctx)
@@ -214,6 +219,10 @@ module QUIC
         LibSSL.SSL_set_connect_state(@ssl)
         alpn = Bytes[0x02, 0x68, 0x33] # "\x02h3"
         LibSSL.SSL_set_alpn_protos(@ssl, alpn, alpn.size)
+        # Load saved session ticket for 0-RTT resumption if provided
+        if ticket = @config.session_ticket
+          load_session(ticket)
+        end
         do_handshake
       end
     end
@@ -312,7 +321,43 @@ module QUIC
     def handshake_complete? : Bool
       LibSSL.SSL_is_init_finished(@ssl) != 0
     end
-    
+
+    # Returns true if this connection resumed a previously saved session (0-RTT eligible).
+    def session_resumed? : Bool
+      LibSSL.SSL_session_reused(@ssl) != 0
+    end
+
+    # Serializes the current TLS session for later 0-RTT resumption.
+    # Returns nil if no session is available yet (NST not yet received).
+    def session_bytes : Bytes?
+      session = LibSSL.SSL_get1_session(@ssl)
+      return nil if session.null?
+      begin
+        null_ptr = Pointer(UInt8).null
+        len = LibSSL.i2d_SSL_SESSION(session, pointerof(null_ptr))
+        return nil if len <= 0
+        buf = Bytes.new(len)
+        ptr = buf.to_unsafe
+        LibSSL.i2d_SSL_SESSION(session, pointerof(ptr))
+        buf
+      ensure
+        LibSSL.SSL_SESSION_free(session)
+      end
+    end
+
+    # Loads a previously serialized session. Must be called before do_handshake.
+    def load_session(ticket : Bytes)
+      ptr = ticket.to_unsafe
+      session = LibSSL.d2i_SSL_SESSION(nil, pointerof(ptr), ticket.size.to_i64)
+      return if session.null?
+      begin
+        LibSSL.SSL_set_session(@ssl, session)
+        Log.trace { "TLS: loaded session ticket (#{ticket.size} bytes) for 0-RTT" }
+      ensure
+        LibSSL.SSL_SESSION_free(session)
+      end
+    end
+
     def finalize
       LibSSL.SSL_free(@ssl)
       LibSSL.SSL_CTX_free(@ssl_ctx)
@@ -324,14 +369,30 @@ lib LibSSL
   TLS1_3_VERSION = 0x0304
   SSL_CTRL_SET_MIN_PROTO_VERSION = 123
   SSL_CTRL_SET_MAX_PROTO_VERSION = 124
-  
+
   fun SSL_is_init_finished(ssl : SSL) : Int32
   fun SSL_set_accept_state(ssl : SSL)
   fun SSL_set_connect_state(ssl : SSL)
   fun ssl_set_verify = SSL_set_verify(ssl : SSL, mode : Int32, callback : Void*) : Void
   fun SSL_do_handshake(ssl : SSL) : Int32
-  
   fun SSL_set_alpn_protos(ssl : SSL, protos : UInt8*, protos_len : LibC::UInt) : Int32
+
+  # Session management for 0-RTT resumption
+  fun SSL_get1_session(ssl : SSL) : Void*
+  fun SSL_set_session(ssl : SSL, session : Void*) : Int32
+  fun SSL_SESSION_free(session : Void*) : Void
+  fun i2d_SSL_SESSION(session : Void*, pp : UInt8**) : Int32
+  fun d2i_SSL_SESSION(a : Void*, pp : UInt8**, length : LibC::Long) : Void*
+  fun SSL_session_reused(ssl : SSL) : Int32
+
+  # 0-RTT / Early Data
+  fun SSL_CTX_set_max_early_data(ctx : SSLContext, max_early_data : UInt32) : Int32
+
+  # SSL_CTX_set_session_cache_mode is a macro in OpenSSL 3 — use ssl_ctx_ctrl directly
+  SSL_CTRL_SET_SESS_CACHE_MODE = 44
+  SSL_SESS_CACHE_CLIENT        = 0x0001
+  SSL_SESS_CACHE_SERVER        = 0x0002
+  SSL_SESS_CACHE_BOTH          = 0x0003
 
   OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND = 2001
   OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD = 2002

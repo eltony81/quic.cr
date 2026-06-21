@@ -14,7 +14,11 @@ module QUIC
     
     property cert_file : String = "cert.pem"
     property key_file : String = "key.pem"
-    
+
+    # Optional TLS session ticket for 0-RTT resumption.
+    # Set on the client before creating the connection to trigger early-data mode.
+    property session_ticket : Bytes? = nil
+
     def initialize
     end
   end

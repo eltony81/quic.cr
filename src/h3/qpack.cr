@@ -5,6 +5,15 @@ require "./qpack/dynamic_table"
 
 module H3
   module QPACK
+    # Raised by Decoder#decode when the header block references dynamic table entries
+    # that have not yet been received from the peer's encoder stream (RFC 9204 §2.1.1).
+    class QpackBlockedError < Exception
+      getter required_insert_count : UInt64
+      def initialize(@required_insert_count : UInt64)
+        super("QPACK blocked: need #{required_insert_count} dynamic table insertions")
+      end
+    end
+
     def self.decode_string(io : IO, n : Int32, first_byte : UInt8? = nil) : String
       b = first_byte || io.read_byte || return ""
       h_mask = (1_u8 << n)
@@ -192,16 +201,41 @@ module H3
 
     class Decoder
       getter dynamic_table = DynamicTable.new
+      getter last_required_insert_count : UInt64 = 0
+
+      # Signalled whenever the dynamic table grows (via process_encoder_stream).
+      # Blocked streams wait on this channel then retry decode.
+      getter table_updated = Channel(Nil).new(32)
+
+      # Processes instructions arriving on the peer's QPACK encoder stream.
+      # Updates our dynamic table and unblocks any streams waiting on it.
+      def process_encoder_stream(data : Bytes)
+        prev = @dynamic_table.insert_count
+        InstructionDecoder.new(@dynamic_table).decode(IO::Memory.new(data))
+        added = @dynamic_table.insert_count - prev
+        added.times do
+          select
+          when @table_updated.send(nil)
+          else
+          end
+        end
+      end
 
       def decode(bytes : Bytes) : Hash(String, String)
         headers = {} of String => String
         io = IO::Memory.new(bytes)
         return headers if io.size == 0
-        
+
         # 1. Read Required Insert Count (RIC)
         first = io.read_byte || return headers
         ric = Integer.decode(io, first, 8)
-        
+        @last_required_insert_count = ric.to_u64
+
+        # Block if the dynamic table hasn't received enough entries yet (RFC 9204 §2.1.1)
+        if ric > 0 && ric.to_u64 > @dynamic_table.insert_count
+          raise QpackBlockedError.new(ric.to_u64)
+        end
+
         # 2. Read Base
         second = io.read_byte || return headers
         base_sign = (second & 0x80) != 0

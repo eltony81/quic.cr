@@ -16,6 +16,11 @@ module H3
     @next_server_bidi : UInt64 = 1
     @next_server_uni : UInt64 = 3
 
+    # Guards concurrent writes to the decoder stream (Section Ack + ICI).
+    @decoder_stream_mutex = Mutex.new
+    # Tracks how many dynamic table entries we have already acknowledged.
+    @last_acked_insert_count : UInt64 = 0
+
     def initialize(@quic)
     end
 
@@ -39,6 +44,18 @@ module H3
       @decoder_stream_local = open_uni_stream(0x03_u64)
     end
 
+    # Processes QPACK encoder stream data arriving from the peer.
+    # Updates our dynamic table and unblocks any streams waiting on it.
+    def process_encoder_stream(data : Bytes)
+      prev = @qpack_decoder.dynamic_table.insert_count
+      @qpack_decoder.process_encoder_stream(data)
+      added = @qpack_decoder.dynamic_table.insert_count - prev
+      # Send Insert Count Increment to let the peer's encoder know entries arrived.
+      if added > 0
+        send_insert_count_increment(added)
+      end
+    end
+
     def write_frame(stream : IO, frame : Frame)
       if frame.is_a?(HeadersFrame)
         payload = @qpack_encoder.encode(frame.headers)
@@ -52,8 +69,37 @@ module H3
       end
     end
 
+    # Reads and decodes the next H3 frame from the stream.
+    # If a HEADERS frame references dynamic table entries not yet received,
+    # blocks until the peer's encoder stream delivers them (RFC 9204 §2.1.1).
+    # After successfully decoding a HEADERS frame with dynamic refs, sends a
+    # Section Acknowledgment on the decoder stream (RFC 9204 §4.4.1).
     def read_frame(stream : IO) : Frame
-      Frame.decode(stream, @qpack_decoder)
+      sid = stream.is_a?(QUIC::StreamSocket) ? stream.stream_id : nil
+      frame = Frame.decode(stream, @qpack_decoder)
+
+      # Unblock if the dynamic table hasn't caught up yet
+      while frame.is_a?(BlockedHeadersFrame)
+        blocked = frame
+        select
+        when @qpack_decoder.table_updated.receive
+        when timeout(5.seconds)
+          raise "QPACK blocked stream timed out waiting for encoder stream entries"
+        end
+        begin
+          headers = @qpack_decoder.decode(blocked.raw_payload)
+          frame = HeadersFrame.new(headers)
+        rescue QPACK::QpackBlockedError
+          # Still not enough entries; keep waiting
+        end
+      end
+
+      # Send Section Acknowledgment when dynamic table references were used
+      if frame.is_a?(HeadersFrame) && (s = sid) && @qpack_decoder.last_required_insert_count > 0
+        send_section_ack(s)
+      end
+
+      frame
     end
 
     private def flush_encoder_stream
@@ -66,6 +112,30 @@ module H3
       # Reset the buffer for the next batch of instructions
       enc_io.clear
       enc_io.rewind
+    end
+
+    # Section Acknowledgment (RFC 9204 §4.4.1): 1XXXXXXX stream_id (7-bit prefix)
+    private def send_section_ack(stream_id : UInt64)
+      write_decoder_instruction do |io|
+        QPACK::Integer.encode(io, stream_id, 7, 0x80_u8)
+        @last_acked_insert_count = @qpack_decoder.dynamic_table.insert_count
+      end
+    end
+
+    # Insert Count Increment (RFC 9204 §4.4.3): 00XXXXXX count (6-bit prefix)
+    private def send_insert_count_increment(count : UInt64)
+      write_decoder_instruction do |io|
+        QPACK::Integer.encode(io, count, 6, 0x00_u8)
+      end
+    end
+
+    private def write_decoder_instruction(&block : IO ->)
+      return unless sock = @decoder_stream_local
+      @decoder_stream_mutex.synchronize do
+        buf = IO::Memory.new
+        block.call(buf)
+        sock.write(buf.to_slice)
+      end
     end
 
     private def generate_stream_id(bidirectional : Bool) : UInt64

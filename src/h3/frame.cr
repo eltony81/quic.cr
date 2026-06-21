@@ -44,18 +44,32 @@ module H3
 
   class HeadersFrame < Frame
     getter headers : Hash(String, String)
-    
+
     def initialize(@headers)
     end
-    
+
     def type : FrameType; FrameType::HEADERS; end
-    
+
     def encode(io : IO)
       payload = QPACK::Encoder.new.encode(@headers)
       QUIC::VarInt.write(io, type.to_u64)
       QUIC::VarInt.write(io, payload.size.to_u64)
       io.write payload
     end
+  end
+
+  # Returned by Frame.decode when a HEADERS payload can't be decoded yet because
+  # the peer's encoder stream hasn't delivered enough dynamic table entries.
+  # The caller must wait for the table to grow, then decode raw_payload manually.
+  class BlockedHeadersFrame < Frame
+    getter raw_payload : Bytes
+    getter required_insert_count : UInt64
+
+    def initialize(@raw_payload, @required_insert_count)
+    end
+
+    def type : FrameType; FrameType::HEADERS; end
+    def encode(io : IO); end
   end
 
   abstract class Frame
@@ -71,8 +85,12 @@ module H3
       when FrameType::HEADERS.to_u64
         buf = Bytes.new(length)
         io.read_fully(buf)
-        headers = (qpack_decoder || QPACK::Decoder.new).decode(buf)
-        HeadersFrame.new(headers)
+        begin
+          headers = (qpack_decoder || QPACK::Decoder.new).decode(buf)
+          HeadersFrame.new(headers)
+        rescue e : QPACK::QpackBlockedError
+          BlockedHeadersFrame.new(buf, e.required_insert_count)
+        end
       when FrameType::SETTINGS.to_u64
         settings = {} of UInt64 => UInt64
         start = io.pos

@@ -149,23 +149,30 @@ module H3
               end
             end
 
-            # Dispatch new client-initiated bidirectional streams (ID % 4 == 0)
+            # Dispatch new client-initiated streams
             quic_conn.streams.each do |stream_id, _stream|
-              next unless stream_id % 4 == 0
               stream_key = {conn_key, stream_id}
               next if handled_streams.includes?(stream_key)
-              handled_streams << stream_key
 
-              sock = QUIC::StreamSocket.new(quic_conn, stream_id)
-              spawn do
-                begin
-                  handle_request(h3_conn, sock)
-                  Log.debug { "Handled stream #{stream_id}" }
-                rescue e
-                  Log.error { "Stream #{stream_id} error: #{e.class} — #{e.message}" }
-                ensure
-                  event_chan.send({:send, conn_key.as(Bytes | String), client_addr})
+              if stream_id % 4 == 0
+                # Client-initiated bidirectional: HTTP/3 request
+                handled_streams << stream_key
+                sock = QUIC::StreamSocket.new(quic_conn, stream_id)
+                spawn do
+                  begin
+                    handle_request(h3_conn, sock)
+                    Log.debug { "Handled stream #{stream_id}" }
+                  rescue e
+                    Log.error { "Stream #{stream_id} error: #{e.class} — #{e.message}" }
+                  ensure
+                    event_chan.send({:send, conn_key.as(Bytes | String), client_addr})
+                  end
                 end
+              elsif stream_id % 4 == 2
+                # Client-initiated unidirectional: control / QPACK encoder / decoder
+                handled_streams << stream_key
+                sock = QUIC::StreamSocket.new(quic_conn, stream_id)
+                spawn { handle_uni_stream(h3_conn, sock) }
               end
             end
 
@@ -258,6 +265,44 @@ module H3
     end
 
     # ------------------------------------------------------------------ Private
+
+    # Handles a client-initiated unidirectional stream: reads the stream type and
+    # dispatches to the appropriate handler (QPACK encoder/decoder, control, etc.).
+    private def handle_uni_stream(h3_conn : H3::Connection, stream : QUIC::StreamSocket)
+      type = QUIC::VarInt.decode(stream)
+      case type
+      when 0x02  # QPACK encoder stream: client sends dynamic table insertions
+        buf = Bytes.new(4096)
+        loop do
+          n = stream.read(buf)
+          break if n == 0
+          h3_conn.process_encoder_stream(buf[0, n])
+        end
+      when 0x03  # QPACK decoder stream: client acknowledges our encoder instructions
+        # Section Acks and ICIs from the peer — consume but don't need to act on for now
+        buf = Bytes.new(512)
+        loop do
+          n = stream.read(buf)
+          break if n == 0
+        end
+      when 0x00  # Control stream: client sends SETTINGS and other control frames
+        # Consume and ignore for now (we already applied our own settings)
+        buf = Bytes.new(512)
+        loop do
+          n = stream.read(buf)
+          break if n == 0
+        end
+      else
+        # Unknown stream type — RFC requires ignoring
+        buf = Bytes.new(512)
+        loop do
+          n = stream.read(buf)
+          break if n == 0
+        end
+      end
+    rescue e
+      Log.debug { "Uni-stream (#{stream.stream_id}) closed: #{e.message}" }
+    end
 
     private def extract_dcid(data : Bytes) : String
       io       = IO::Memory.new(data)

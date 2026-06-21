@@ -9,7 +9,8 @@ module H3
     @socket : UDPSocket
     @remote_addr : Socket::IPAddress
     @connected : Bool = false
-    
+    @handled_server_streams = Set(UInt64).new
+
     def initialize(host : String, port : Int32, config : QUIC::Config)
       @remote_addr = Socket::IPAddress.new(host, port)
       @socket = UDPSocket.new
@@ -33,12 +34,24 @@ module H3
         raise "QUIC handshake timed out"
       end
       @connected = true
-      
-      # Establish H3 Streams
-      @h3_conn.open_uni_stream(0_u64) # Control Stream
-      @h3_conn.open_uni_stream(0x02_u64) # Encoder Stream
-      @h3_conn.open_uni_stream(0x03_u64) # Decoder Stream
+
+      # Establish H3 Streams (control + QPACK encoder/decoder)
+      @h3_conn.open_uni_stream(0_u64)    # Control Stream
+      @h3_conn.open_qpack_streams
       pump_send
+    end
+
+    # Returns the serialized TLS session ticket for 0-RTT resumption on the next
+    # connection. Call this after at least one request has been completed — the
+    # server sends the NewSessionTicket post-handshake, so it may not be available
+    # immediately after connect().
+    def session_bytes : Bytes?
+      @quic_conn.session_bytes
+    end
+
+    # True if this connection resumed a previously saved session (0-RTT was attempted).
+    def session_resumed? : Bool
+      @quic_conn.session_resumed?
     end
 
     def initialize(@quic_conn : QUIC::Connection)
@@ -160,11 +173,51 @@ module H3
           if bytes_read > 0
             @quic_conn.recv(buf[0, bytes_read])
             pump_send
+            process_server_uni_streams
           end
         rescue e : Socket::Error
           break if @socket.closed?
         rescue e : Exception
           Log.trace { "Client receive error: #{e.message}" }
+        end
+      end
+    end
+
+    # Detects newly-arrived server-initiated unidirectional streams and dispatches
+    # each in a background fiber (QPACK encoder stream, control stream, etc.).
+    private def process_server_uni_streams
+      @quic_conn.streams.each do |stream_id, _|
+        next unless stream_id % 4 == 3  # server-initiated uni
+        next if @handled_server_streams.includes?(stream_id)
+        @handled_server_streams << stream_id
+        sock = QUIC::StreamSocket.new(@quic_conn, stream_id)
+        spawn do
+          begin
+            type = QUIC::VarInt.decode(sock)
+            case type
+            when 0x02  # QPACK encoder stream from server
+              ibuf = Bytes.new(4096)
+              loop do
+                n = sock.read(ibuf)
+                break if n == 0
+                @h3_conn.process_encoder_stream(ibuf[0, n])
+              end
+            when 0x03  # QPACK decoder stream from server — consume acks
+              ibuf = Bytes.new(512)
+              loop do
+                n = sock.read(ibuf)
+                break if n == 0
+              end
+            else  # control stream or unknown — consume
+              ibuf = Bytes.new(512)
+              loop do
+                n = sock.read(ibuf)
+                break if n == 0
+              end
+            end
+          rescue e
+            Log.trace { "Server uni stream #{stream_id} closed: #{e.message}" }
+          end
         end
       end
     end

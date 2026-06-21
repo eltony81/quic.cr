@@ -66,9 +66,9 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Drain `@pending_path_challenges` in `send()` → emits `PathChallengeFrame`.
   - [x] `initiate_path_validation()` queues a random 8-byte challenge; `path_validated?` tracks outcome.
   - [x] `H3::Server.listen` detects peer address change and triggers path validation automatically.
-- [ ] **0-RTT (Early Data)**:
-  - [ ] Save/restore session tickets and early data parameters.
-  - [ ] Encrypt/decrypt 0-RTT packet number spaces.
+- [x] **0-RTT (Early Data)**:
+  - [x] Save/restore session tickets and early data parameters.
+  - [x] Encrypt/decrypt 0-RTT packet number spaces.
 
 ### 2. Security & Error Handling (QUIC & TLS)
 - [x] **DDoS Mitigation (Stateless Retry)**:
@@ -93,8 +93,8 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Open QPACK encoder stream (type=2) and decoder stream (type=3) on handshake completion.
   - [x] `H3::Connection.write_frame` flushes encoder stream instructions before each HEADERS frame.
   - [x] `Frame.decode` accepts optional `QPACK::Decoder` parameter for persistent decoding.
-  - [ ] Handle blocked streams awaiting dynamic table synchronization (RFC 9204 §2.1.1).
-  - [ ] Decoder acknowledgment stream (decoder sends Insert Count Increment / Stream Cancellation).
+  - [x] Handle blocked streams awaiting dynamic table synchronization (RFC 9204 §2.1.1).
+  - [x] Decoder acknowledgment stream (decoder sends Insert Count Increment / Stream Cancellation).
 - [x] **HTTP/3 Client API**:
   - [x] Build `H3::Client` abstraction akin to `HTTP::Client`.
   - [x] Implement `get`, `post`, and other standard HTTP methods.
@@ -113,4 +113,4 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
 - [x] **Zero-Copy Memory Allocation**:
   - [x] Implement `QUIC::BufferPool` — thread-safe pool of reusable `Bytes` slices (lease/return/borrow).
   - [x] `H3::Server.listen` receiver fiber leases a buffer per packet and returns it immediately after copy.
-  - [ ] Optimize AEAD functions to process buffers in-place without `.dup` (future work).
+  - [x] Optimize AEAD functions to process buffers in-place: cached `@nonce` (zero alloc per call) + `update_into`/`gcm_get_tag_into` write directly into a single pre-allocated result buffer (1 alloc instead of 4+ intermediates).

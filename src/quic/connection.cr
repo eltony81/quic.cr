@@ -33,6 +33,7 @@ module QUIC
     
     @space_initial : PacketNumberSpace = PacketNumberSpace.new
     @space_handshake : PacketNumberSpace = PacketNumberSpace.new
+    @space_zero_rtt : PacketNumberSpace = PacketNumberSpace.new  # 0-RTT early data
     @space_app : PacketNumberSpace = PacketNumberSpace.new
 
     getter streams = {} of UInt64 => Stream
@@ -67,6 +68,18 @@ module QUIC
     
     def handshake_complete? : Bool
       @tls.handshake_complete?
+    end
+
+    # Returns serialized TLS session bytes for 0-RTT resumption on the next connection.
+    # Available after the server has sent a NewSessionTicket (typically after the first
+    # response is received). Returns nil if the session is not yet available.
+    def session_bytes : Bytes?
+      @tls.session_bytes
+    end
+
+    # Returns true if the current connection resumed a saved TLS session (0-RTT mode).
+    def session_resumed? : Bool
+      @tls.session_resumed?
     end
 
     @pending_path_responses = [] of Bytes
@@ -270,10 +283,10 @@ module QUIC
         end
 
         space = case type_bits
-                when 0x00 then @space_initial # Initial
-                when 0x01 then @space_initial # HelloRetryRequest (Initial space)
-                when 0x02 then @space_handshake # Handshake
-                else @space_initial # Default fallback
+                when 0x00 then @space_initial    # Initial
+                when 0x01 then @space_zero_rtt   # 0-RTT Protected (RFC 9000 §17.2.3)
+                when 0x02 then @space_handshake  # Handshake
+                else @space_initial
                 end
 
         token_len = 0_u64
@@ -630,6 +643,9 @@ module QUIC
                   else
                     @space_initial
                   end
+                elsif @space_zero_rtt.aead_tx && !@tls.handshake_complete?
+                  # 0-RTT mode: send stream data before the handshake completes
+                  @space_zero_rtt
                 else
                   @space_app.aead_tx ? @space_app : @space_initial
                 end
@@ -644,9 +660,12 @@ module QUIC
       packet = if space == @space_app
                  return 0 if @dcid.nil?
                  ShortHeaderPacket.new(@dcid.not_nil!)
+               elsif space == @space_zero_rtt
+                 return 0 if @scid.nil? || @dcid.nil?
+                 LongHeaderPacket.new(PacketType::ZeroRTT, 0x00000001_u32, @dcid.not_nil!, @scid.not_nil!)
                else
                  return 0 if @scid.nil? || @dcid.nil?
-                 packet_type = space == @space_initial ? PacketType::Initial : (space == @space_handshake ? PacketType::Handshake : PacketType::Short)
+                 packet_type = space == @space_initial ? PacketType::Initial : PacketType::Handshake
                  LongHeaderPacket.new(
                    packet_type,
                    0x00000001_u32,
@@ -731,7 +750,7 @@ module QUIC
       end
       
       # ENFORCE CONGESTION CONTROL
-      if space == @space_app && @recovery.can_send?
+      if (space == @space_app || space == @space_zero_rtt) && @recovery.can_send?
         # Aggiungiamo i frame di Flow Control se pendenti
         if @pending_max_data
           packet.frames << MaxDataFrame.new(@max_data_local)
@@ -979,6 +998,16 @@ module QUIC
       hp  = Crypto.hkdf_expand_label(secret, "quic hp", Bytes.empty, 16)
 
       case label
+      when "CLIENT_EARLY_TRAFFIC_SECRET"
+        # 0-RTT write key (client) / read key (server)
+        if @is_server
+          @space_zero_rtt.aead_rx = Crypto::AEAD.new(key, iv)
+          @space_zero_rtt.hp_rx   = Crypto::HeaderProtection.new(hp)
+        else
+          @space_zero_rtt.aead_tx = Crypto::AEAD.new(key, iv)
+          @space_zero_rtt.hp_tx   = Crypto::HeaderProtection.new(hp)
+        end
+        Log.trace { "0-RTT keys installed (#{@is_server ? "read" : "write"})" }
       when "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
         @client_handshake_secret = secret
         if @is_server
