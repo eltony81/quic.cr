@@ -19,216 +19,181 @@ module H3
   #
   #   H3::Server.new(router).listen("0.0.0.0", 4433, cert: "cert.pem", key: "key.pem")
   #
-  # When using `listen`, the server manages its own QUIC::Server + UDP loop.
+  # When using `listen`, each QUIC connection is owned by a dedicated actor fiber
+  # (ConnectionActor). With --flag preview_mt, actors run on multiple OS threads.
   class Server
     Log = ::Log.for("H3::Server")
 
-    # Low-level handler type (backwards-compatible).
     alias LowLevelHandler = Proc(Hash(String, String), Bytes, {Hash(String, String), Bytes})
 
     @low_level_handler : LowLevelHandler?
     @router : H3::Router?
 
-    # ------------------------------------------------------------------ Constructors
-
-    # Mode 1: low-level block handler.
     def initialize(&handler : Hash(String, String), Bytes -> {Hash(String, String), Bytes})
       @low_level_handler = handler
     end
 
-    # Mode 2: router-based.
     def initialize(router : H3::Router)
       @router = router
     end
 
-    # ------------------------------------------------------------------ Blocking listen
-
-    # Starts a fully managed QUIC/UDP server loop.
-    #
-    # Parameters:
-    # - host       — bind address (default "0.0.0.0")
-    # - port       — UDP port (default 4433)
-    # - cert       — path to TLS certificate PEM
-    # - key        — path to TLS private key PEM
-    # - max_data   — connection-level flow control window (default 10 MB)
     def listen(
-      host     : String      = "0.0.0.0",
-      port     : Int32       = 4433,
-      cert     : String      = "cert.pem",
-      key      : String      = "key.pem",
-      max_data : UInt64      = 10_000_000_u64
+      host     : String = "0.0.0.0",
+      port     : Int32  = 4433,
+      cert     : String = "cert.pem",
+      key      : String = "key.pem",
+      max_data : UInt64 = 10_000_000_u64
     )
       config = QUIC::Config.new
-      config.cert_file                         = cert
-      config.key_file                          = key
-      config.initial_max_data                  = max_data == 10_000_000_u64 ? 50_000_000_u64 : max_data
+      config.cert_file                           = cert
+      config.key_file                            = key
+      config.initial_max_data                    = max_data == 10_000_000_u64 ? 50_000_000_u64 : max_data
       config.initial_max_stream_data_bidi_local  = 10_000_000_u64
       config.initial_max_stream_data_bidi_remote = 10_000_000_u64
-      config.initial_max_streams_bidi          = 128_u64
-      config.initial_max_streams_uni           = 128_u64
-      config.initial_max_stream_data_uni       = 10_000_000_u64
+      config.initial_max_streams_bidi            = 128_u64
+      config.initial_max_streams_uni             = 128_u64
+      config.initial_max_stream_data_uni         = 10_000_000_u64
 
       udp = UDPSocket.new
       udp.bind(host, port)
+      batch_receiver = QUIC::BatchReceiver.new(udp)
+      batch_receiver.enable_gro!(udp)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
 
-      connections     = {} of String => {QUIC::Connection, H3::Connection, Socket::IPAddress}
-      handled_streams = Set(Tuple(String, UInt64)).new
-      
-      event_chan = Channel(Tuple(Symbol, Bytes | String, Socket::IPAddress)).new(1000)
+      # Router-only state — never touched by actor fibers (no mutex needed).
+      connections = {} of String => ConnectionActor
+      buf_pool    = QUIC::BufferPool.new
 
-      buf_pool = QUIC::BufferPool.new
+      # Single RouterMsg channel avoids Crystal's select union-type merging.
+      # Struct wrappers give the case/when branches distinct types to narrow on.
+      router_chan = Channel(RouterMsg).new(4096 + 512)
 
-      # Spawn background receiver fiber
+      # Receiver fiber: block on first datagram via epoll, then drain the queue.
       spawn do
         loop do
           buf = buf_pool.lease
           begin
             size, client_addr = udp.receive(buf)
-            # Copy only the received bytes; return the leased buffer immediately
             packet_data = buf[0, size].dup
             buf_pool.return(buf)
-            event_chan.send({:packet, packet_data.as(Bytes | String), client_addr})
+            router_chan.send(RouterPacket.new(packet_data, client_addr))
+
+            n = batch_receiver.drain_nowait
+            n.times do |i|
+              data, addr = batch_receiver.packet(i)
+              next if data.empty?
+              router_chan.send(RouterPacket.new(data, addr))
+            end
           rescue e
             buf_pool.return(buf)
             break if udp.closed?
+            Log.debug { "recv error: #{e.message}" }
           end
         end
       end
 
-      out_buf = Bytes.new(65536)
-
+      # Router loop — single fiber, sole owner of `connections`.
+      # Struct-tagged messages dispatch cleanly without select type merging.
       loop do
-        select
-        when event = event_chan.receive
-          event_type, payload, client_addr = event
-          if event_type == :packet
-            packet_data = payload.as(Bytes)
-            conn_key   = extract_dcid(packet_data)
-            Log.info { "Processing packet for conn_key: #{conn_key} (size: #{packet_data.size})" }
-            conn_tuple = connections[conn_key]?
+        msg = router_chan.receive
+        case msg
+        when RouterPacket
+          data     = msg.data
+          addr     = msg.addr
+          conn_key = extract_dcid(data)
+          addr_key = addr.to_s
 
-            if conn_tuple.nil?
-              Log.debug { "New connection (DCID: #{conn_key})" }
-              quic_conn = QUIC::Connection.new(config, is_server: true)
-              h3_conn   = H3::Connection.new(quic_conn)
-              conn_tuple = {quic_conn, h3_conn, client_addr}
-              connections[conn_key] = conn_tuple
-            end
-
-            quic_conn, h3_conn, prev_addr = conn_tuple
-
-            # RFC 9000 §9: detect connection migration (peer address change)
-            if prev_addr != client_addr && quic_conn.handshake_complete?
-              Log.info { "Connection migration: #{prev_addr} → #{client_addr}" }
-              quic_conn.initiate_path_validation
-            end
-
-            # Update current remote address in connection tuple
-            conn_tuple = {quic_conn, h3_conn, client_addr}
-            connections[conn_key] = conn_tuple
-
-            was_completed = quic_conn.handshake_complete?
-            quic_conn.recv(packet_data)
-
-            # Map the server-chosen Source Connection ID (SCID) to the same connection
-            if scid = quic_conn.scid
-              connections[scid.hexstring] = conn_tuple
-            end
-
-            # Send control, QPACK encoder, and decoder streams upon handshake completion
-            if !was_completed && quic_conn.handshake_complete?
-              begin
-                ctrl = h3_conn.open_uni_stream(0_u64)
-                sf   = H3::SettingsFrame.new
-                sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 100_u64, 0x06_u64 => 100_u64}
-                h3_conn.write_frame(ctrl, sf)
-                h3_conn.open_qpack_streams
-              rescue e
-                Log.error { "Failed to initialize server control stream: #{e.message}" }
-              end
-            end
-
-            # Dispatch new client-initiated streams
-            quic_conn.streams.each do |stream_id, _stream|
-              stream_key = {conn_key, stream_id}
-              next if handled_streams.includes?(stream_key)
-
-              if stream_id % 4 == 0
-                # Client-initiated bidirectional: HTTP/3 request
-                handled_streams << stream_key
-                sock = QUIC::StreamSocket.new(quic_conn, stream_id)
-                spawn do
-                  begin
-                    handle_request(h3_conn, sock)
-                    Log.debug { "Handled stream #{stream_id}" }
-                  rescue e
-                    Log.error { "Stream #{stream_id} error: #{e.class} — #{e.message}" }
-                  ensure
-                    event_chan.send({:send, conn_key.as(Bytes | String), client_addr})
-                  end
-                end
-              elsif stream_id % 4 == 2
-                # Client-initiated unidirectional: control / QPACK encoder / decoder
-                handled_streams << stream_key
-                sock = QUIC::StreamSocket.new(quic_conn, stream_id)
-                spawn { handle_uni_stream(h3_conn, sock) }
-              end
-            end
-
-            while (n = quic_conn.send(out_buf)) > 0
-              udp.send(out_buf[0, n], client_addr)
-            end
-          elsif event_type == :send
-            conn_key = payload.as(String)
-            Log.info { "Processing send event for conn_key: #{conn_key}" }
-            if conn_tuple = connections[conn_key]?
-              quic_conn, _, _ = conn_tuple
-              sent_any = false
-              while (n = quic_conn.send(out_buf)) > 0
-                udp.send(out_buf[0, n], client_addr)
-                Log.info { "Sent #{n} bytes to #{client_addr}" }
-                sent_any = true
-              end
-              Log.info { "Send loop finished, sent_any = #{sent_any}" }
-            else
-              Log.info { "Connection not found for key: #{conn_key}" }
-            end
+          # Primary lookup by DCID; fallback to source addr for packets that
+          # arrive before the actor's RouterReg (new SCID) is processed.
+          # Race: the actor sends its RouterReg then flushes the ServerHello
+          # in the same fiber turn. Python sends a Handshake (DCID=server SCID)
+          # ~1ms later, but the RouterReg isn't processed until all 8 actor
+          # fibers yield — potentially 8ms. addr_key is stable across the
+          # entire connection life, so it acts as a safe fallback.
+          actor = connections[conn_key]? || connections[addr_key]?
+          if actor.nil?
+            quic_conn = QUIC::Connection.new(config, is_server: true)
+            h3_conn   = H3::Connection.new(quic_conn)
+            actor = ConnectionActor.new(
+              quic_conn, h3_conn, addr, udp, self,
+              router_chan, conn_key
+            )
+            connections[conn_key] = actor
+            connections[addr_key]  = actor
+          elsif !connections[conn_key]?
+            # DCID is a new SCID not yet registered — cache it for fast future lookup.
+            connections[conn_key] = actor
           end
-          nil
+          actor.deliver(data)
 
-        when timeout(10.milliseconds)
-          connections.each_value do |tuple|
-            quic_conn, _, client_addr = tuple
-            quic_conn.tick
-            while (n = quic_conn.send(out_buf)) > 0
-              udp.send(out_buf[0, n], client_addr)
-            end
-          end
-          nil
+        when RouterReg
+          connections[msg.key] = msg.actor
+
+        when RouterClean
+          connections.delete(msg.key)
+          connections.delete(msg.addr_key)
         end
       end
     rescue e : Exception
       Log.error { "Server fatal error: #{e.message}\n#{e.backtrace.join("\n")}" }
     end
 
-    # ------------------------------------------------------------------ Request dispatch
+    # ── Request dispatch ───────────────────────────────────────────────────────
 
     # Handles a single request on the given stream IO.
-    # Called internally by `listen` and directly in unit tests.
+    # Called internally by ConnectionActor and directly in unit tests.
     def handle_request(h3_conn : H3::Connection, stream : IO, remote_address : String = "")
-      req_frame = h3_conn.read_frame(stream)
+      # Read first frame — QPACK::ValidationError bubbles up as H3_MESSAGE_ERROR.
+      req_frame = begin
+        h3_conn.read_frame(stream)
+      rescue e : QPACK::ValidationError
+        h3_conn.quic.close(H3::ErrorCode::H3_MESSAGE_ERROR, e.message || "header validation error")
+        return
+      rescue
+        return
+      end
+
+      # Reject wrong frame types before the first HEADERS (RFC 9114 §4.1, §7.2).
+      case req_frame
+      when DataFrame
+        h3_conn.quic.close(H3::ErrorCode::H3_FRAME_UNEXPECTED, "DATA frame before HEADERS on request stream")
+        return
+      when SettingsFrame
+        h3_conn.quic.close(H3::ErrorCode::H3_FRAME_UNEXPECTED, "SETTINGS frame on request stream")
+        return
+      when PushPromiseFrame
+        h3_conn.quic.close(H3::ErrorCode::H3_ID_ERROR, "client MUST NOT send PUSH_PROMISE")
+        return
+      end
       return unless req_frame.is_a?(HeadersFrame)
+
+      # Validate required request pseudo-headers (RFC 9114 §4.3.1).
+      hdrs = req_frame.headers
+      unless hdrs.has_key?(":method") && hdrs.has_key?(":path") && hdrs.has_key?(":scheme")
+        h3_conn.quic.close(H3::ErrorCode::H3_MESSAGE_ERROR, "missing required request pseudo-header")
+        return
+      end
+      # :status is a response-only pseudo-header — illegal in a request.
+      if hdrs.has_key?(":status")
+        h3_conn.quic.close(H3::ErrorCode::H3_MESSAGE_ERROR, ":status pseudo-header in request")
+        return
+      end
 
       body_io = IO::Memory.new
       loop do
         begin
           nxt = h3_conn.read_frame(stream)
-          if nxt.is_a?(DataFrame)
+          case nxt
+          when DataFrame
             body_io.write(nxt.data)
-          elsif nxt.is_a?(HeadersFrame)
-            # Stop if we hit a HeadersFrame (trailers)
-            break
+          when HeadersFrame
+            break  # trailers — body reading stops here
+          when SettingsFrame
+            h3_conn.quic.close(H3::ErrorCode::H3_FRAME_UNEXPECTED, "SETTINGS frame on request stream")
+            return
+          when PushPromiseFrame
+            h3_conn.quic.close(H3::ErrorCode::H3_ID_ERROR, "client MUST NOT send PUSH_PROMISE")
+            return
           else
             break
           end
@@ -264,11 +229,9 @@ module H3
       end
     end
 
-    # ------------------------------------------------------------------ Private
-
     # Handles a client-initiated unidirectional stream: reads the stream type and
     # dispatches to the appropriate handler (QPACK encoder/decoder, control, etc.).
-    private def handle_uni_stream(h3_conn : H3::Connection, stream : QUIC::StreamSocket)
+    def handle_uni_stream(h3_conn : H3::Connection, stream : IO)
       type = QUIC::VarInt.decode(stream)
       case type
       when 0x02  # QPACK encoder stream: client sends dynamic table insertions
@@ -279,35 +242,30 @@ module H3
           h3_conn.process_encoder_stream(buf[0, n])
         end
       when 0x03  # QPACK decoder stream: client acknowledges our encoder instructions
-        # Section Acks and ICIs from the peer — consume but don't need to act on for now
         buf = Bytes.new(512)
-        loop do
-          n = stream.read(buf)
-          break if n == 0
-        end
+        loop { break if stream.read(buf) == 0 }
       when 0x00  # Control stream: client sends SETTINGS and other control frames
-        # Consume and ignore for now (we already applied our own settings)
         buf = Bytes.new(512)
-        loop do
-          n = stream.read(buf)
-          break if n == 0
-        end
+        loop { break if stream.read(buf) == 0 }
       else
         # Unknown stream type — RFC requires ignoring
         buf = Bytes.new(512)
-        loop do
-          n = stream.read(buf)
-          break if n == 0
-        end
+        loop { break if stream.read(buf) == 0 }
       end
     rescue e
-      Log.debug { "Uni-stream (#{stream.stream_id}) closed: #{e.message}" }
+      if stream.responds_to?(:stream_id)
+        Log.debug { "Uni-stream (#{stream.stream_id}) closed: #{e.message}" }
+      else
+        Log.debug { "Uni-stream closed: #{e.message}" }
+      end
     end
 
+    # ── Private ────────────────────────────────────────────────────────────────
+
     private def extract_dcid(data : Bytes) : String
-      io       = IO::Memory.new(data)
-      first    = io.read_byte || 0_u8
-      is_long  = (first & 0x80) != 0
+      io      = IO::Memory.new(data)
+      first   = io.read_byte || 0_u8
+      is_long = (first & 0x80) != 0
       if is_long
         io.skip(4)   # version
         len  = io.read_byte || 0_u8

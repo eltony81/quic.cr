@@ -58,6 +58,13 @@ module H3
     end
   end
 
+  # Received when the client sends a PUSH_PROMISE frame; clients MUST NOT send
+  # PUSH_PROMISE (RFC 9114 §7.2.5), so this always triggers H3_ID_ERROR.
+  class PushPromiseFrame < Frame
+    def type : FrameType; FrameType::PUSH_PROMISE; end
+    def encode(io : IO); end
+  end
+
   # Returned by Frame.decode when a HEADERS payload can't be decoded yet because
   # the peer's encoder stream hasn't delivered enough dynamic table entries.
   # The caller must wait for the table to grow, then decode raw_payload manually.
@@ -92,16 +99,24 @@ module H3
           BlockedHeadersFrame.new(buf, e.required_insert_count)
         end
       when FrameType::SETTINGS.to_u64
+        # Read the payload into a buffer so we can iterate without io.pos
+        # (which raises on non-seekable IOs such as StreamSocket or MockSocket).
+        buf = Bytes.new(length)
+        io.read_fully(buf)
         settings = {} of UInt64 => UInt64
-        start = io.pos
-        while io.pos - start < length
-          k = QUIC::VarInt.decode(io)
-          v = QUIC::VarInt.decode(io)
+        settings_io = IO::Memory.new(buf)
+        while settings_io.pos < settings_io.size
+          k = QUIC::VarInt.decode(settings_io)
+          v = QUIC::VarInt.decode(settings_io)
           settings[k] = v
         end
         frame = SettingsFrame.new
         frame.settings = settings
         frame
+      when FrameType::PUSH_PROMISE.to_u64
+        buf = Bytes.new(length)
+        io.read_fully(buf)
+        PushPromiseFrame.new
       else
         # Fallback/ignore unknown types
         buf = Bytes.new(length)

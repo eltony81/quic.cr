@@ -1,24 +1,5 @@
 require "./spec_helper"
 
-class MockSocket < IO
-  getter read_io : IO::Memory
-  getter write_io : IO::Memory
-
-  def initialize(read_bytes : Bytes = Bytes.empty)
-    @read_io = IO::Memory.new(read_bytes)
-    @write_io = IO::Memory.new
-  end
-
-  def read(slice : Bytes) : Int32
-    @read_io.read(slice)
-  end
-
-  def write(slice : Bytes) : Nil
-    @write_io.write(slice)
-    nil
-  end
-end
-
 describe H3 do
   it "supports QPACK encoding and decoding" do
     headers = {
@@ -148,6 +129,7 @@ describe H3 do
     
     h3_client_conn = H3::Connection.new(quic_client)
     h3_server = H3::Server.new do |headers, body|
+      headers[":method"].should eq("POST")
       headers[":path"].should eq("/greet")
       String.new(body).should eq("client message")
       
@@ -160,7 +142,9 @@ describe H3 do
 
     # 1. Client serializes request to client socket
     client_socket = MockSocket.new
-    h3_client_conn.write_frame(client_socket, H3::HeadersFrame.new({":path" => "/greet"}))
+    h3_client_conn.write_frame(client_socket, H3::HeadersFrame.new(
+      {":method" => "POST", ":scheme" => "https", ":authority" => "localhost", ":path" => "/greet"}
+    ))
     h3_client_conn.write_frame(client_socket, H3::DataFrame.new("client message".to_slice))
     
     # Get the payload sent by the client

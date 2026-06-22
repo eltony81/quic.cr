@@ -14,6 +14,15 @@ module H3
       end
     end
 
+    # Raised by Decoder#decode when the field section violates RFC 9114 §4.3 rules:
+    # duplicate pseudo-headers, or a regular header appearing before all pseudo-headers.
+    # Callers should treat this as H3_MESSAGE_ERROR.
+    class ValidationError < Exception
+      def initialize(msg : String)
+        super(msg)
+      end
+    end
+
     def self.decode_string(io : IO, n : Int32, first_byte : UInt8? = nil) : String
       b = first_byte || io.read_byte || return ""
       h_mask = (1_u8 << n)
@@ -252,58 +261,73 @@ module H3
           end
         end
 
+        seen_pseudo  = Set(String).new  # detect duplicate pseudo-headers
+        past_pseudos = false            # detect regular header before pseudo-headers
+
         while io.pos < io.size
           b = io.read_byte || break
-          
+          field_name  = ""
+          field_value = ""
+          should_break = false
+
           if (b & 0x80) == 0x80
             # 1 T XXXXXX (Indexed Field Line)
             is_static = (b & 0x40) != 0
             idx = Integer.decode(io, b, 6).to_i
             entry = is_static ? STATIC_TABLE[idx]? : @dynamic_table.get_by_relative(base, idx.to_u64)
             if entry
-              headers[entry[0]] = entry[1]
+              field_name  = entry[0]
+              field_value = entry[1]
             end
-            
+
           elsif (b & 0xC0) == 0x40
             # 01 N T XXXX (Literal Field Line With Name Reference)
             is_static = (b & 0x10) != 0
             idx = Integer.decode(io, b, 4).to_i
             entry = is_static ? STATIC_TABLE[idx]? : @dynamic_table.get_by_relative(base, idx.to_u64)
-            name = entry ? entry[0] : ""
-            value = H3::QPACK.decode_string(io, 7)
-            if !name.empty?
-              headers[name] = value
-            end
-            
+            field_name  = entry ? entry[0] : ""
+            field_value = H3::QPACK.decode_string(io, 7)
+
           elsif (b & 0xE0) == 0x20
             # 001 N H XXX (Literal Field Line Without Name Reference)
-            # N is bit 4 (0x10)
-            name = H3::QPACK.decode_string(io, 3, b)
-            value = H3::QPACK.decode_string(io, 7)
-            if !name.empty?
-              headers[name] = value
-            end
-            
+            field_name  = H3::QPACK.decode_string(io, 3, b)
+            field_value = H3::QPACK.decode_string(io, 7)
+
           elsif (b & 0xF0) == 0x10
             # 0001 XXXXX (Indexed Field Line With Post-Base Index)
             idx = Integer.decode(io, b, 4).to_i
             if entry = @dynamic_table.get_by_post_base(base, idx.to_u64)
-              headers[entry[0]] = entry[1]
+              field_name  = entry[0]
+              field_value = entry[1]
             end
-            
+
           elsif (b & 0xF8) == 0x00
             # 0000 N XXX (Literal Field Line With Post-Base Name Reference)
             idx = Integer.decode(io, b, 3).to_i
             entry = @dynamic_table.get_by_post_base(base, idx.to_u64)
-            name = entry ? entry[0] : ""
-            value = H3::QPACK.decode_string(io, 7)
-            if !name.empty?
-              headers[name] = value
-            end
+            field_name  = entry ? entry[0] : ""
+            field_value = H3::QPACK.decode_string(io, 7)
+
           else
-            # Unrecognized/Reserved pattern, break to avoid infinite loop
-            break
+            should_break = true
           end
+
+          break if should_break
+          next if field_name.empty?
+
+          # RFC 9114 §4.3: pseudo-headers must precede regular headers; no duplicates.
+          if field_name.starts_with?(":")
+            if past_pseudos
+              raise ValidationError.new("pseudo-header '#{field_name}' appears after regular header")
+            end
+            if seen_pseudo.includes?(field_name)
+              raise ValidationError.new("duplicate pseudo-header '#{field_name}'")
+            end
+            seen_pseudo << field_name
+          else
+            past_pseudos = true
+          end
+          headers[field_name] = field_value
         end
         headers
       end
