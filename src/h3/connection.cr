@@ -141,24 +141,42 @@ module H3
     private def generate_stream_id(bidirectional : Bool) : UInt64
       if @quic.is_server?
         if bidirectional
+          check_stream_limit(@next_server_bidi, @quic.max_streams_bidi_remote, "bidi")
           id = @next_server_bidi
           @next_server_bidi += 4
           id
         else
+          check_stream_limit(@next_server_uni, @quic.max_streams_uni_remote, "uni")
           id = @next_server_uni
           @next_server_uni += 4
           id
         end
       else
         if bidirectional
+          check_stream_limit(@next_client_bidi, @quic.max_streams_bidi_remote, "bidi")
           id = @next_client_bidi
           @next_client_bidi += 4
           id
         else
+          check_stream_limit(@next_client_uni, @quic.max_streams_uni_remote, "uni")
           id = @next_client_uni
           @next_client_uni += 4
           id
         end
+      end
+    end
+
+    # RFC 9000 §4.6: raise if the peer's stream limit would be exceeded.
+    # `next_id` is the next stream ID we would use; divide by 4 to get the
+    # ordinal (stream IDs are 4k+offset).  A limit of 0 means "not yet known"
+    # (transport params not applied) — allow opening freely in that case.
+    private def check_stream_limit(next_id : UInt64, limit : UInt64, kind : String)
+      return if limit == 0
+      ordinal = next_id / 4
+      if ordinal >= limit
+        raise QUIC::ProtocolViolation.new(
+          "#{kind} stream limit exceeded (limit=#{limit}, ordinal=#{ordinal})"
+        )
       end
     end
   end

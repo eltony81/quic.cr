@@ -14,12 +14,13 @@ module QUIC
     property id : UInt64
     property local_address : Socket::IPAddress?
     property remote_address : Socket::IPAddress?
-    property recovery : Recovery = Recovery.new
+    property recovery : Recovery
     property? validated : Bool = false
     property bytes_sent : UInt64 = 0
     property bytes_received : UInt64 = 0
 
-    def initialize(@id, @local_address = nil, @remote_address = nil)
+    def initialize(@id, initial_cwnd : UInt64 = Recovery::INITIAL_WINDOW, @local_address = nil, @remote_address = nil)
+      @recovery = Recovery.new(initial_cwnd)
       @validated = true if @id == 0
     end
   end
@@ -61,6 +62,17 @@ module QUIC
     @close_sent : Bool = false
     @close_error : UInt64 = 0
     @close_reason : String = ""
+
+    # RESET_STREAM frames to emit on next send (stream_id, error_code, final_size).
+    @pending_reset_streams = [] of {UInt64, UInt64, UInt64}
+
+    # Outbound max-stream limits received from the peer (updated by MAX_STREAMS frames).
+    getter max_streams_bidi_remote : UInt64 = 0_u64
+    getter max_streams_uni_remote  : UInt64 = 0_u64
+
+    # Server queues one HANDSHAKE_DONE frame immediately after handshake completes.
+    @pending_handshake_done : Bool = false
+    @handshake_notified     : Bool = false
     
     # Event notification channels to avoid sleep polling
     getter handshake_chan : Channel(Bool) = Channel(Bool).new(1)
@@ -121,6 +133,10 @@ module QUIC
 
     @initial_handshake_bytes = IO::Memory.new
     @handshake_handshake_bytes = IO::Memory.new
+    # Pre-allocated send buffers — reused every call to avoid GC pressure in send().
+    @send_payload_io = IO::Memory.new(2048)
+    @send_header_io  = IO::Memory.new(256)
+    @send_ad_io      = IO::Memory.new(256)
     @dcid_locked = false
 
     def initialize(@config : Config, @is_server : Bool)
@@ -136,7 +152,8 @@ module QUIC
       @crypto_tx_offsets[@space_handshake] = 0_u64
       @crypto_tx_offsets[@space_app] = 0_u64
 
-      @paths << Path.new(0)
+      initial_cwnd = @config.initial_cwnd_packets.to_u64 * Recovery::MAX_DATAGRAM_SIZE
+      @paths << Path.new(0, initial_cwnd)
       @recovery = @paths[0].recovery
 
       unless @is_server
@@ -184,7 +201,7 @@ module QUIC
 
     def recv(data : Bytes) : Int32
       return 0 if @closed
-      
+
       begin
         # Stateless Reset Check (RFC 9000 Section 10.3)
         if !@is_server && data.size >= 37
@@ -198,30 +215,60 @@ module QUIC
 
         active_path.bytes_received += data.size.to_u64
 
-      final_data = data.dup
+        # RFC 9000 §12.2: a UDP datagram may contain multiple coalesced QUIC
+        # packets (long-header first, short-header last). Process all of them.
+        offset = 0
+        while offset < data.size
+          pkt = data[offset..].dup
+          consumed = recv_packet(pkt)
+          break if consumed <= 0
+          offset += consumed
+        end
+
+        data.size
+      rescue e : QUIC::Error
+        Log.error { "QUIC Protocol Error: #{e.class} - #{e.message}" }
+        @closed = true
+        @close_error = e.error_code
+        @close_reason = e.message || "Protocol Error"
+        0
+      rescue e : Exception
+        Log.error { "QUIC Internal Error: #{e.class} - #{e.message}" }
+        @closed = true
+        @close_error = QUIC::ErrorCode::INTERNAL_ERROR
+        @close_reason = "Internal Error"
+        0
+      end
+    end
+
+    # Processes exactly one QUIC packet from `data` and returns the number of
+    # bytes consumed (0 on failure).  Called in a loop by recv() to handle
+    # coalesced datagrams (RFC 9000 §12.2).
+    private def recv_packet(data : Bytes) : Int32
+      final_data = data
       io = IO::Memory.new(final_data)
-      
+
       first_byte = io.read_byte || return 0
       is_long = (first_byte & 0x80) != 0
-      
+
       if is_long
         version = IO::ByteFormat::NetworkEndian.decode(UInt32, io)
         Log.trace { "RECV DEBUG: long header version=#{version.to_s(16)} first_byte=#{first_byte.to_s(16)}" }
         dcid_len = io.read_byte || return 0
         dcid = Bytes.new(dcid_len)
         io.read_fully(dcid)
-        
+
         setup_initial_secrets(dcid) unless @space_initial.aead_rx
-        
+
         scid_len = io.read_byte || return 0
         scid = Bytes.new(scid_len)
         io.read_fully(scid)
-        
+
         if !@is_server && !@dcid_locked
           @dcid = scid
           @dcid_locked = true
         end
-        
+
         if !@is_server && version == 0x00000000_u32
           @version_negotiation_failed = true
           @closed = true
@@ -229,11 +276,11 @@ module QUIC
         end
 
         if @is_server && @dcid.nil?
-          @dcid = scid 
+          @dcid = scid
           @scid = Random::Secure.random_bytes(8)
           @original_destination_connection_id = dcid
           @initial_source_connection_id = @scid
-          
+
           tp = TransportParameters.new
           tp.max_idle_timeout = @config.max_idle_timeout
           tp.initial_max_data = @config.initial_max_data
@@ -246,9 +293,9 @@ module QUIC
           tp.initial_source_connection_id = @scid.not_nil!
           @tls.update_local_tp(tp)
         end
-        
+
         type_bits = (first_byte >> 4) & 0x03
-        
+
         if !@is_server && type_bits == 0x03
           # Retry packet
           token_len = io.size - io.pos - 16
@@ -294,12 +341,12 @@ module QUIC
           token_len = VarInt.decode(io)
           io.skip(token_len)
         end
-        
+
         length_val = VarInt.decode(io)
         pn_offset = io.pos.to_i
-        
+
         Log.trace { "RECV DEBUG: type_bits=#{type_bits} token_len=#{token_len} length_val=#{length_val} pn_offset=#{pn_offset} final_data_size=#{final_data.size}" }
-        
+
         return data.size unless space.hp_rx
 
         sample_offset = pn_offset + 4
@@ -309,17 +356,17 @@ module QUIC
         Log.trace { "RECV DEBUG: mask=#{mask.hexstring} first_byte_before=#{final_data[0].to_s(16)}" }
         space.hp_rx.not_nil!.apply!(final_data, pn_offset, mask, unprotect: true)
         Log.trace { "RECV DEBUG: first_byte_after=#{final_data[0].to_s(16)}" }
-        
+
         pn_len = (final_data[0] & 0x03) + 1
         packet_end = pn_offset + length_val
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len ... packet_end]
-        
+
         pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
         pn = case pn_len
              when 1 then pn_io.read_byte.not_nil!.to_u64
              when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
-             when 3 
+             when 3
                b = Bytes.new(3)
                pn_io.read_fully(b)
                (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
@@ -328,8 +375,10 @@ module QUIC
              end
 
         Log.trace { "RECV DEBUG: pn=#{pn} pn_len=#{pn_len} ciphertext_size=#{ciphertext.size} ad=#{ad.hexstring}" }
-        plaintext = space.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
-        
+        aead = space.aead_rx
+        return data.size unless aead
+        plaintext = aead.decrypt(ad, pn, ciphertext)
+
         space.received_pns << pn
 
         has_ack_eliciting = false
@@ -342,28 +391,32 @@ module QUIC
           handle_frame(frame, space)
         end
         space.pending_ack = true if has_ack_eliciting
+
+        # Return bytes consumed by this long-header packet so recv() can advance
+        # to the next coalesced packet (short-header is always last, per RFC).
+        packet_end.to_i
       else
-        # Short Header
+        # Short Header — always the last packet in a coalesced datagram.
         dcid = Bytes.new(8)
         io.read_fully(dcid)
         pn_offset = io.pos.to_i
-        
-        return data.size unless @space_app.hp_rx
+
+        return 0 unless @space_app.hp_rx
 
         sample_offset = pn_offset + 4
         sample = final_data[sample_offset .. sample_offset + 15]
         mask = @space_app.hp_rx.not_nil!.mask(sample)
         @space_app.hp_rx.not_nil!.apply!(final_data, pn_offset, mask, unprotect: true)
-        
+
         pn_len = (final_data[0] & 0x03) + 1
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len .. -1]
-        
+
         pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
         pn = case pn_len
              when 1 then pn_io.read_byte.not_nil!.to_u64
              when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
-             when 3 
+             when 3
                b = Bytes.new(3)
                pn_io.read_fully(b)
                (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
@@ -372,7 +425,7 @@ module QUIC
              end
 
         plaintext = @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
-        
+
         @space_app.received_pns << pn
 
         has_ack_eliciting = false
@@ -385,21 +438,19 @@ module QUIC
           handle_frame(frame, @space_app)
         end
         @space_app.pending_ack = true if has_ack_eliciting
+
+        # Short-header packets extend to the end of the datagram.
+        data.size
       end
-      
-      data.size
-      rescue e : QUIC::Error
-        Log.error { "QUIC Protocol Error: #{e.class} - #{e.message}" }
-        @closed = true
-        @close_error = e.error_code
-        @close_reason = e.message || "Protocol Error"
+    end
+
+    private def space_id(space : PacketNumberSpace) : Int32
+      if space == @space_initial
         0
-      rescue e : Exception
-        Log.error { "QUIC Internal Error: #{e.class} - #{e.message}" }
-        @closed = true
-        @close_error = QUIC::ErrorCode::INTERNAL_ERROR
-        @close_reason = "Internal Error"
-        0
+      elsif space == @space_handshake
+        1
+      else
+        2
       end
     end
 
@@ -423,7 +474,9 @@ module QUIC
         end
         @data_received += frame.data.size
         stream.receive_data(frame.offset, frame.data)
-        stream.close_remote if frame.fin
+        if frame.fin
+          stream.set_fin_offset(frame.offset + frame.data.size)
+        end
         
         # Notify channel that stream has new data/state update
         if chan = @stream_chans[frame.id]?
@@ -433,10 +486,11 @@ module QUIC
           end
         end
       when AckFrame
-        @paths.each &.recovery.on_ack_received(frame)
-        
+        sid = space_id(space)
+        @paths.each { |p| p.recovery.on_ack_received(frame, space_id: sid) }
+
         # Trigger loss detection
-        lost_pkts = @recovery.detect_lost_packets(frame.largest_acknowledged)
+        lost_pkts = @recovery.detect_lost_packets(frame.largest_acknowledged, space_id: sid)
         lost_pkts.each do |pkt|
           pkt.frames.each do |f|
             # Retransmit data-bearing frames
@@ -474,6 +528,35 @@ module QUIC
         # RFC 9000 §8.2.2: validate path if data matches an outstanding challenge
         if @outstanding_path_challenges.delete(frame.data.hexstring)
           @path_validated = true
+        end
+      when ResetStreamFrame
+        # RFC 9000 §3.4: peer aborted its send side — unblock any waiting reader.
+        stream = @streams[frame.id] ||= begin
+          max_remote, max_local = initial_stream_limits(frame.id)
+          Stream.new(frame.id, max_remote, max_local)
+        end
+        stream.reset!(frame.error_code)
+        if chan = @stream_chans[frame.id]?
+          select
+          when chan.send(true)
+          else
+          end
+        end
+      when StopSendingFrame
+        # RFC 9000 §3.5: peer wants us to stop sending — respond with RESET_STREAM.
+        if stream = @streams[frame.id]?
+          @pending_reset_streams << {frame.id, frame.error_code, stream.tx_offset}
+          stream.close_local
+        end
+      when HandshakeDoneFrame
+        # RFC 9001 §4.9.2: server confirmed handshake — client discards HS keys.
+        discard_initial_handshake_keys unless @is_server
+      when MaxStreamsFrame
+        # RFC 9000 §4.6: peer raised our outbound stream limit.
+        if frame.bidirectional
+          @max_streams_bidi_remote = Math.max(@max_streams_bidi_remote, frame.maximum_streams)
+        else
+          @max_streams_uni_remote = Math.max(@max_streams_uni_remote, frame.maximum_streams)
         end
       when ConnectionCloseFrame
         Log.trace { "RECV ConnectionCloseFrame: error_code=0x#{frame.error_code.to_s(16)} reason=#{frame.reason}" }
@@ -537,8 +620,10 @@ module QUIC
           @tls.handle_data(concatenated, LibSSL::OSSL_RECORD_PROTECTION_LEVEL_APPLICATION)
         end
         
-        # If handshake has completed, notify
-        if @tls.handshake_complete?
+        # If handshake has completed, notify once and queue HANDSHAKE_DONE (server).
+        if @tls.handshake_complete? && !@handshake_notified
+          @handshake_notified = true
+          @pending_handshake_done = true if @is_server
           select
           when @handshake_chan.send(true)
           else
@@ -652,7 +737,7 @@ module QUIC
         tls_data = nil
       end
 
-      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @pending_path_challenges.empty? && @lost_frames.empty?
+      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @pending_path_challenges.empty? && @lost_frames.empty? && !@pending_handshake_done && @pending_reset_streams.empty?
         Log.trace { "SEND DEBUG: return 0 (no tls_data, no ack, no stream data, no lost frames)" }
         return 0
       end
@@ -744,9 +829,20 @@ module QUIC
       end
       
       if space.pending_ack && !space.received_pns.empty?
-        largest = space.received_pns.max
-        packet.frames << AckFrame.new(largest, 0_u64, 0_u64)
+        space.received_pns.sort!
+        largest = space.received_pns.last
+        # Count consecutive run from largest downward for first_ack_range
+        first_ack_range = 0_u64
+        i = space.received_pns.size - 2
+        while i >= 0 && space.received_pns[i] == largest - first_ack_range - 1
+          first_ack_range += 1
+          i -= 1
+        end
+        packet.frames << AckFrame.new(largest, 0_u64, first_ack_range)
         space.pending_ack = false
+        # Remove only the contiguous top range we just acknowledged; keep any gaps
+        ack_min = largest - first_ack_range
+        space.received_pns.reject! { |pn| pn >= ack_min && pn <= largest }
       end
       
       # ENFORCE CONGESTION CONTROL
@@ -774,6 +870,20 @@ module QUIC
         end
         @pending_max_stream_data.clear
 
+        # HANDSHAKE_DONE: server tells client the handshake is confirmed, then
+        # discards Initial and Handshake keys (RFC 9001 §4.9.2).
+        if @pending_handshake_done && @is_server && space == @space_app
+          packet.frames << HandshakeDoneFrame.new
+          @pending_handshake_done = false
+          discard_initial_handshake_keys
+        end
+
+        # RESET_STREAM: abort send side of a stream (RFC 9000 §3.4).
+        @pending_reset_streams.each do |id, error_code, final_size|
+          packet.frames << ResetStreamFrame.new(id, error_code, final_size)
+        end
+        @pending_reset_streams.clear
+
         # 1. Drain retransmission queue — one frame per send call to stay within MTU
         if !@lost_frames.empty?
           packet.frames << @lost_frames.shift
@@ -787,7 +897,7 @@ module QUIC
         conn_available = @max_data_remote > @data_sent ? @max_data_remote - @data_sent : 0_u64
         
         @streams.each_value do |stream|
-          offset, data, send_fin, blocked_reason = stream.poll_send_data(1000, conn_available)
+          offset, data, send_fin, blocked_reason = stream.poll_send_data(1200, conn_available)
           
           if data.size > 0 || send_fin
             packet.frames << StreamFrame.new(stream.id, offset, data, send_fin)
@@ -805,54 +915,70 @@ module QUIC
       
       return 0 if packet.frames.empty?
       
-      payload_io = IO::Memory.new
-      packet.frames.each &.encode(payload_io)
-      payload = payload_io.to_slice
-      
+      @send_payload_io.clear
+      packet.frames.each &.encode(@send_payload_io)
+      payload = @send_payload_io.to_slice
+
       pn_len = 4
       tag_len = 16
       length = pn_len + payload.size + tag_len
-      
-      header_io = IO::Memory.new
+
+      @send_header_io.clear
       Log.trace { "SEND DEBUG: encoding packet with type #{packet.is_a?(LongHeaderPacket) ? packet.as(LongHeaderPacket).type : "Short"} and pn #{packet.packet_number}" }
       packet.frames.each do |f|
         unless f.is_a?(PaddingFrame)
           Log.trace { "SEND FRAME: #{f.class.name} #{f.inspect}" }
         end
       end
-      packet.encode_header(header_io)
+      packet.encode_header(@send_header_io)
       if space != @space_app
-        VarInt.write(header_io, length.to_u64)
+        VarInt.write(@send_header_io, length.to_u64)
       end
-      header = header_io.to_slice
-      
-      ad_io = IO::Memory.new
-      ad_io.write header
-      IO::ByteFormat::NetworkEndian.encode(packet.packet_number.to_u32, ad_io)
-      ad = ad_io.to_slice
-      
-      ciphertext = space.aead_tx.not_nil!.encrypt(ad, packet.packet_number, payload)
-      
-      final_io = IO::Memory.new
-      final_io.write ad
-      final_io.write ciphertext
-      final_data = final_io.to_slice
-      
-      sample = ciphertext[0..15]
-      mask = space.hp_tx.not_nil!.mask(sample)
-      space.hp_tx.not_nil!.apply!(final_data, header.size, mask, unprotect: false)
+      header = @send_header_io.to_slice
 
-      ack_eliciting = packet.frames.any? { |f| !f.is_a?(AckFrame) && !f.is_a?(PaddingFrame) && !f.is_a?(ConnectionCloseFrame) }
-      @recovery.on_packet_sent(packet.packet_number, final_data.size, packet.frames, ack_eliciting)
-      space.packet_number += 1
-      active_path.bytes_sent += final_data.size.to_u64
+      @send_ad_io.clear
+      @send_ad_io.write header
+      IO::ByteFormat::NetworkEndian.encode(packet.packet_number.to_u32, @send_ad_io)
+      ad = @send_ad_io.to_slice
       
-      if final_data.size > out_buffer.size
-        Log.error { "SEND: packet too large (#{final_data.size} bytes), dropping" }
+      # Write ad (header + packet_number) directly into out_buffer — no intermediate alloc.
+      ad.copy_to(out_buffer)
+      # Encrypt payload directly after ad — eliminates ciphertext Bytes.new + final_io.
+      ct_size = space.aead_tx.not_nil!.encrypt_into(ad, packet.packet_number, payload, out_buffer[ad.size..])
+      final_size = ad.size + ct_size
+
+      if final_size > out_buffer.size
+        Log.error { "SEND: packet too large (#{final_size} bytes), dropping" }
         return 0
       end
-      out_buffer[0, final_data.size].copy_from(final_data)
-      final_data.size
+
+      sample = out_buffer[ad.size, 16]
+      mask = space.hp_tx.not_nil!.mask(sample)
+      space.hp_tx.not_nil!.apply!(out_buffer[0, final_size], header.size, mask, unprotect: false)
+
+      ack_eliciting = packet.frames.any? { |f| !f.is_a?(AckFrame) && !f.is_a?(PaddingFrame) && !f.is_a?(ConnectionCloseFrame) }
+      @recovery.on_packet_sent(packet.packet_number, final_size, packet.frames, ack_eliciting, space_id: space_id(space))
+      space.packet_number += 1
+      active_path.bytes_sent += final_size.to_u64
+      final_size
+    end
+
+    # Pack multiple QUIC packets (Initial + Handshake + 1-RTT) into one UDP
+    # datagram per RFC 9000 §12.2. Long-header packets carry a Length field so
+    # the receiver can parse them consecutively; short-header (1-RTT) must be last.
+    def send_coalesced(out_buffer : Bytes) : Int32
+      total = 0
+      3.times do
+        remaining = out_buffer[total, out_buffer.size - total]
+        n = send(remaining)
+        break if n <= 0
+        first_byte = remaining[0]
+        is_long_header = (first_byte & 0x80) != 0
+        total += n
+        break unless is_long_header
+        break if total >= out_buffer.size - 64
+      end
+      total
     end
 
     def initial_stream_limits(stream_id : UInt64) : {UInt64, UInt64}
@@ -892,6 +1018,8 @@ module QUIC
       return if @remote_tp_applied
       if tp = @tls.remote_transport_parameters
         @max_data_remote = tp.initial_max_data
+        @max_streams_bidi_remote = tp.initial_max_streams_bidi if tp.initial_max_streams_bidi > 0
+        @max_streams_uni_remote  = tp.initial_max_streams_uni  if tp.initial_max_streams_uni  > 0
         @streams.each do |stream_id, stream|
           max_remote, _ = initial_stream_limits(stream_id)
           stream.update_max_stream_data(max_remote)
@@ -924,7 +1052,8 @@ module QUIC
     end
 
     def add_path(id : UInt64, local_address = nil, remote_address = nil) : Path
-      path = Path.new(id, local_address, remote_address)
+      initial_cwnd = @config.initial_cwnd_packets.to_u64 * Recovery::MAX_DATAGRAM_SIZE
+      path = Path.new(id, initial_cwnd, local_address, remote_address)
       @paths << path
       path
     end
@@ -965,6 +1094,22 @@ module QUIC
         @space_app.aead_rx = Crypto::AEAD.new(server_key, server_iv)
         @space_app.aead_tx = Crypto::AEAD.new(client_key, client_iv)
       end
+    end
+
+    # RFC 9001 §4.9.2: discard Initial and Handshake keys once the TLS handshake
+    # is confirmed.  Called by the server after sending HANDSHAKE_DONE and by the
+    # client upon receiving it.  Packets arriving on those spaces are ignored (their
+    # AEAD is nil, so recv() skips them with `next if aead_rx.nil?`).
+    private def discard_initial_handshake_keys
+      @space_initial.aead_rx   = nil
+      @space_initial.aead_tx   = nil
+      @space_initial.hp_rx     = nil
+      @space_initial.hp_tx     = nil
+      @space_handshake.aead_rx = nil
+      @space_handshake.aead_tx = nil
+      @space_handshake.hp_rx   = nil
+      @space_handshake.hp_tx   = nil
+      Log.debug { "Discarded Initial+Handshake keys (RFC 9001 §4.9.2)" }
     end
 
     private def setup_initial_secrets(dcid : Bytes)

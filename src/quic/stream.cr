@@ -17,13 +17,16 @@ module QUIC
     
     @send_read_pos : Int64 = 0
     @recv_read_pos : Int64 = 0
-    
+
     getter max_stream_data_remote : UInt64
     getter max_stream_data_local : UInt64
-    
+
     @rx_offset : UInt64 = 0
-    @tx_offset : UInt64 = 0
-    
+    getter tx_offset : UInt64 = 0
+    @fin_offset : UInt64? = nil
+    @reset_error_code : UInt64? = nil
+    @ooo_buffer : Array({UInt64, Bytes}) = [] of {UInt64, Bytes}
+
     def initialize(@id, @max_stream_data_remote, @max_stream_data_local)
     end
 
@@ -41,7 +44,18 @@ module QUIC
       to_write
     end
 
+    # RFC 9000 §3.4: remote aborted its send side — any pending read returns EOF.
+    def reset!(error_code : UInt64 = 0_u64)
+      @state = StreamState::Reset
+      @reset_error_code = error_code
+    end
+
+    def reset_received? : Bool
+      @state == StreamState::Reset
+    end
+
     def read(data : Bytes) : Int32
+      return 0 if @state == StreamState::Reset  # treat reset stream as EOF
       return 0 if @recv_read_pos >= @recv_buffer.size
       
       remaining = @recv_buffer.size - @recv_read_pos
@@ -52,19 +66,64 @@ module QUIC
       len
     end
 
+    def set_fin_offset(offset : UInt64)
+      @fin_offset = offset if @fin_offset.nil? || offset < @fin_offset.not_nil!
+      check_fin_ready
+    end
+
     def receive_data(offset : UInt64, data : Bytes)
       @state = StreamState::Open if @state == StreamState::Idle
       return if @state == StreamState::Closed || @state == StreamState::HalfClosedRemote
 
       if offset + data.size > @max_stream_data_local
         raise ProtocolViolation.new("Flow control limit exceeded (offset: #{offset}, data_size: #{data.size}, max_local: #{@max_stream_data_local})")
-
       end
-      
+
       if offset == @rx_offset
         @recv_buffer.seek(0, IO::Seek::End)
         @recv_buffer.write(data)
         @rx_offset += data.size
+        flush_ooo_buffer
+        check_fin_ready
+      elsif offset > @rx_offset
+        # Buffer out-of-order segment unless already buffered at this offset
+        unless @ooo_buffer.any? { |o, _| o == offset }
+          @ooo_buffer << {offset, data.dup}
+          @ooo_buffer.sort_by! &.first
+        end
+      end
+      # offset < @rx_offset: duplicate or retransmit, ignore
+    end
+
+    private def flush_ooo_buffer
+      loop do
+        seg = @ooo_buffer.first?
+        break unless seg
+        off, d = seg
+        if off == @rx_offset
+          @ooo_buffer.shift
+          @recv_buffer.seek(0, IO::Seek::End)
+          @recv_buffer.write(d)
+          @rx_offset += d.size
+        elsif off < @rx_offset && off + d.size.to_u64 > @rx_offset
+          skip = (@rx_offset - off).to_i
+          @ooo_buffer.shift
+          tail = d[skip..]
+          @recv_buffer.seek(0, IO::Seek::End)
+          @recv_buffer.write(tail)
+          @rx_offset += tail.size
+        elsif off < @rx_offset
+          @ooo_buffer.shift  # fully overlapping duplicate
+        else
+          break  # gap remains
+        end
+      end
+    end
+
+    private def check_fin_ready
+      if (fin = @fin_offset) && @rx_offset >= fin
+        close_remote
+        @fin_offset = nil
       end
     end
 
