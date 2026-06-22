@@ -104,8 +104,15 @@ module QUIC
   end
 
   class TLS
+    # Cache one SSL_CTX per (cert, key) pair so cert/key loading only happens once
+    # per server configuration rather than once per incoming connection.
+    # Guarded by @@ssl_ctx_mutex — preview_mt actors run on separate OS threads.
+    @@ssl_ctx_cache = {} of String => LibSSL::SSLContext
+    @@ssl_ctx_mutex = Mutex.new
+
     @ssl : LibSSL::SSL = Pointer(Void).null.as(LibSSL::SSL)
     @ssl_ctx : LibSSL::SSLContext = Pointer(Void).null.as(LibSSL::SSLContext)
+    @ssl_ctx_owned : Bool = false
     property recv_buf : Bytes? = nil
     getter send_buf_initial : IO::Memory = IO::Memory.new
     getter send_buf_handshake : IO::Memory = IO::Memory.new
@@ -152,17 +159,46 @@ module QUIC
     property on_secret : Proc(String, Bytes, Nil)?
 
     def initialize(@config : Config, @is_server : Bool, scid : Bytes? = nil)
-      method = LibSSL.tls_method
-      @ssl_ctx = LibSSL.ssl_ctx_new(method)
-      LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MIN_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
-      LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MAX_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
-      LibSSL.SSL_CTX_set_ciphersuites(@ssl_ctx, "TLS_AES_128_GCM_SHA256")
-      LibSSL.SSL_CTX_set_keylog_callback(@ssl_ctx, ->QUIC.keylog_cb)
+      if @is_server
+        # Reuse a shared SSL_CTX per cert+key pair — loading cert/key from disk
+        # for every incoming connection adds hundreds of ms under concurrent load,
+        # causing Python's PTO to fire and retransmit ClientHellos that confuse
+        # our TLS state machine.  SSL_CTX is safe to share: cert, key, and ALPN
+        # callback are connection-independent; per-connection state lives in SSL.
+        cache_key = "#{@config.cert_file}:#{@config.key_file}"
+        @@ssl_ctx_mutex.synchronize do
+          if cached = @@ssl_ctx_cache[cache_key]?
+            @ssl_ctx = cached
+            @ssl_ctx_owned = false
+          else
+            @ssl_ctx = LibSSL.ssl_ctx_new(LibSSL.tls_method)
+            LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MIN_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
+            LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MAX_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
+            LibSSL.SSL_CTX_set_ciphersuites(@ssl_ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+            LibSSL.SSL_CTX_set_keylog_callback(@ssl_ctx, ->QUIC.keylog_cb)
+            unless File.exists?(@config.cert_file) && File.exists?(@config.key_file)
+              raise "TLS certificates not found! Please ensure '#{@config.cert_file}' and '#{@config.key_file}' exist."
+            end
+            res1 = LibSSL.ssl_ctx_use_certificate_chain_file(@ssl_ctx, @config.cert_file)
+            res2 = LibSSL.ssl_ctx_use_privatekey_file(@ssl_ctx, @config.key_file, LibSSL::SSLFileType::PEM)
+            Log.trace { "TLS SERVER INITIALIZATION: cert_load=#{res1}, key_load=#{res2}" }
+            LibSSL.ssl_ctx_set_alpn_select_cb(@ssl_ctx, ->QUIC.alpn_select_cb, nil)
+            LibSSL.SSL_CTX_set_max_early_data(@ssl_ctx, 0xffffffff_u32)
+            LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_SERVER, nil)
+            @@ssl_ctx_cache[cache_key] = @ssl_ctx
+            @ssl_ctx_owned = true
+          end
+        end
+      else
+        @ssl_ctx = LibSSL.ssl_ctx_new(LibSSL.tls_method)
+        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MIN_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
+        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_MAX_PROTO_VERSION, LibSSL::TLS1_3_VERSION, nil)
+        LibSSL.SSL_CTX_set_ciphersuites(@ssl_ctx, "TLS_AES_128_GCM_SHA256")
+        LibSSL.SSL_CTX_set_keylog_callback(@ssl_ctx, ->QUIC.keylog_cb)
+        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_CLIENT, nil)
+        @ssl_ctx_owned = true
+      end
 
-      self_box = Box.box(self)
-      LibSSL.ssl_ctx_ctrl(@ssl_ctx, 16, 0, self_box)
-
-      
       tp = TransportParameters.new
       tp.max_idle_timeout = @config.max_idle_timeout
       tp.initial_max_data = @config.initial_max_data
@@ -172,26 +208,12 @@ module QUIC
       tp.initial_max_streams_bidi = @config.initial_max_streams_bidi
       tp.initial_max_streams_uni = @config.initial_max_streams_uni
       tp.initial_source_connection_id = scid if scid
-      
+
       io = IO::Memory.new
       tp.encode(io)
       @local_encoded_tp = io.to_slice
 
-      if @is_server
-        unless File.exists?(@config.cert_file) && File.exists?(@config.key_file)
-          raise "TLS certificates not found! Please ensure '#{@config.cert_file}' and '#{@config.key_file}' exist."
-        end
-        res1 = LibSSL.ssl_ctx_use_certificate_chain_file(@ssl_ctx, @config.cert_file)
-        res2 = LibSSL.ssl_ctx_use_privatekey_file(@ssl_ctx, @config.key_file, LibSSL::SSLFileType::PEM)
-        Log.trace { "TLS SERVER INITIALIZATION: cert_load=#{res1}, key_load=#{res2}" }
-        LibSSL.ssl_ctx_set_alpn_select_cb(@ssl_ctx, ->QUIC.alpn_select_cb, nil)
-        # Enable TLS 1.3 session tickets with 0-RTT support (RFC 9001 §4.6)
-        LibSSL.SSL_CTX_set_max_early_data(@ssl_ctx, 0xffffffff_u32)
-        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_SERVER, nil)
-      else
-        LibSSL.ssl_ctx_ctrl(@ssl_ctx, LibSSL::SSL_CTRL_SET_SESS_CACHE_MODE, LibSSL::SSL_SESS_CACHE_CLIENT, nil)
-      end
-
+      self_box = Box.box(self)
       @ssl = LibSSL.ssl_new(@ssl_ctx)
       LibSSL.SSL_set_ex_data(@ssl, 0, self_box)
 
@@ -322,6 +344,13 @@ module QUIC
       LibSSL.SSL_is_init_finished(@ssl) != 0
     end
 
+    # Returns the negotiated TLS 1.3 cipher suite name (e.g. "TLS_AES_128_GCM_SHA256").
+    def cipher_suite_name : String
+      cipher = LibSSL.ssl_get_current_cipher(@ssl)
+      return "TLS_AES_128_GCM_SHA256" if cipher.null?
+      String.new(LibSSL.ssl_cipher_get_name(cipher))
+    end
+
     # Returns true if this connection resumed a previously saved session (0-RTT eligible).
     def session_resumed? : Bool
       LibSSL.SSL_session_reused(@ssl) != 0
@@ -360,7 +389,8 @@ module QUIC
 
     def finalize
       LibSSL.SSL_free(@ssl)
-      LibSSL.SSL_CTX_free(@ssl_ctx)
+      LibSSL.SSL_CTX_free(@ssl_ctx) if @ssl_ctx_owned
+      # @dispatch is GC-managed (Pointer.malloc uses BDW-GC) — no manual free needed.
     end
   end
 end

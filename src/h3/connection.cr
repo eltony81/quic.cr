@@ -3,8 +3,13 @@ module H3
     getter quic : QUIC::Connection
     @control_stream_local : UInt64?
     @control_stream_remote : UInt64?
+    @control_stream_socket : QUIC::StreamSocket?
     @encoder_stream_local : QUIC::StreamSocket?
     @decoder_stream_local : QUIC::StreamSocket?
+
+    # GOAWAY tracking: the last stream ID we will process (nil = not sent).
+    getter peer_goaway_stream_id : UInt64?
+    property peer_goaway_stream_id : UInt64?
 
     # Persistent QPACK encoder/decoder — shared across all header frames on
     # this connection so the dynamic table accumulates compression state.
@@ -21,7 +26,21 @@ module H3
     # Tracks how many dynamic table entries we have already acknowledged.
     @last_acked_insert_count : UInt64 = 0
 
+    # H3 Datagram callback (RFC 9297): called with (stream_id, payload) for
+    # each incoming QUIC DATAGRAM that carries an H3 Quarter Stream ID prefix.
+    property on_h3_datagram : Proc(UInt64, Bytes, Nil)?
+
     def initialize(@quic)
+      @quic.on_datagram = ->(raw : Bytes) {
+        io = IO::Memory.new(raw)
+        begin
+          qsi = QUIC::VarInt.decode(io)
+          stream_id = qsi * 4
+          rest = raw[io.pos..]
+          @on_h3_datagram.try &.call(stream_id, rest)
+        rescue
+        end
+      }
     end
 
     def open_request_stream : QUIC::StreamSocket
@@ -36,12 +55,44 @@ module H3
       socket
     end
 
+    # Opens the H3 control stream (type=0) and returns its socket.
+    # The caller must write a SETTINGS frame as the first frame (RFC 9114 §6.2.1).
+    def open_control_stream : QUIC::StreamSocket
+      sock = open_uni_stream(0_u64)
+      @control_stream_socket = sock
+      sock
+    end
+
+    # Sends a GOAWAY frame on the control stream (RFC 9114 §7.2.6).
+    # `last_stream_id` is the highest client-initiated bidi stream ID we will process.
+    def send_goaway(last_stream_id : UInt64)
+      if sock = @control_stream_socket
+        frame = GoAwayFrame.new(last_stream_id)
+        buf = IO::Memory.new
+        frame.encode(buf)
+        sock.write(buf.to_slice)
+      end
+    end
+
+    # Sends an H3 Datagram (RFC 9297) with the given stream_id context.
+    # Prepends the Quarter Stream ID (stream_id / 4) as a VarInt.
+    def send_h3_datagram(stream_id : UInt64, data : Bytes)
+      payload = IO::Memory.new
+      QUIC::VarInt.write(payload, stream_id / 4)
+      payload.write(data)
+      @quic.send_datagram(payload.to_slice)
+    end
+
     # Opens the QPACK encoder stream (type=2) and decoder stream (type=3).
+    # Also sends the Set Dynamic Table Capacity instruction (RFC 9204 §3.2.2)
+    # so the peer's QPACK decoder knows the maximum table size.
     # Must be called once the QUIC handshake is complete.
     def open_qpack_streams
       return if @encoder_stream_local
       @encoder_stream_local = open_uni_stream(0x02_u64)
       @decoder_stream_local = open_uni_stream(0x03_u64)
+      @qpack_encoder.set_capacity(4096_u64)
+      flush_encoder_stream
     end
 
     # Processes QPACK encoder stream data arriving from the peer.

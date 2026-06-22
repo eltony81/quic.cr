@@ -83,6 +83,13 @@ module H3
       getter dynamic_table = DynamicTable.new
       getter encoder_stream_io = IO::Memory.new
 
+      # Sets the dynamic table capacity and emits a Set Dynamic Table Capacity
+      # instruction on the encoder stream (RFC 9204 §3.2.2).
+      def set_capacity(capacity : UInt64)
+        @dynamic_table.set_capacity(capacity)
+        Integer.encode(@encoder_stream_io, capacity, 5, 0x20_u8)
+      end
+
       # Encodes a set of headers into a QPACK field section (RFC 9204 Section 4.5).
       #
       # Two-pass design: first insert all novel headers into the dynamic table,

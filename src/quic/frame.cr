@@ -50,7 +50,7 @@ module QUIC
         ResetStreamFrame.new(VarInt.decode(io), VarInt.decode(io), VarInt.decode(io))
       when FrameType::STOP_SENDING.to_u64
         StopSendingFrame.new(VarInt.decode(io), VarInt.decode(io))
-      when FrameType::ACK.to_u64
+      when FrameType::ACK.to_u64, 0x03_u64
         largest = VarInt.decode(io)
         delay = VarInt.decode(io)
         count = VarInt.decode(io)
@@ -61,7 +61,14 @@ module QUIC
           len = VarInt.decode(io)
           ack_ranges << {gap, len}
         end
-        AckFrame.new(largest, delay, first_range, ack_ranges)
+        if type_val == 0x03_u64
+          ect0   = VarInt.decode(io)
+          ect1   = VarInt.decode(io)
+          ecn_ce = VarInt.decode(io)
+          AckFrame.new(largest, delay, first_range, ack_ranges, ect0: ect0, ect1: ect1, ecn_ce: ecn_ce, has_ecn: true)
+        else
+          AckFrame.new(largest, delay, first_range, ack_ranges)
+        end
       when FrameType::MAX_DATA.to_u64
         MaxDataFrame.new(VarInt.decode(io))
       when FrameType::MAX_STREAM_DATA.to_u64
@@ -257,15 +264,33 @@ module QUIC
     getter ack_delay : UInt64
     getter first_ack_range : UInt64
     getter ack_ranges : Array({UInt64, UInt64})
+    # ECN counts (type 0x03, RFC 9000 §19.3.2)
+    getter ect0 : UInt64 = 0_u64
+    getter ect1 : UInt64 = 0_u64
+    getter ecn_ce : UInt64 = 0_u64
+    getter? has_ecn : Bool = false
 
-    def initialize(@largest_acknowledged, @ack_delay, @first_ack_range, @ack_ranges = [] of {UInt64, UInt64}); end
+    def initialize(@largest_acknowledged, @ack_delay, @first_ack_range,
+                   @ack_ranges = [] of {UInt64, UInt64},
+                   ect0 : UInt64 = 0_u64, ect1 : UInt64 = 0_u64,
+                   ecn_ce : UInt64 = 0_u64, has_ecn : Bool = false)
+      @ect0 = ect0
+      @ect1 = ect1
+      @ecn_ce = ecn_ce
+      @has_ecn = has_ecn
+    end
+
     def type : FrameType; FrameType::ACK; end
     def encode(io : IO)
       VarInt.write(io, type.to_u64)
       VarInt.write(io, @largest_acknowledged)
       VarInt.write(io, @ack_delay)
-      VarInt.write(io, 0_u64)
+      VarInt.write(io, @ack_ranges.size.to_u64)
       VarInt.write(io, @first_ack_range)
+      @ack_ranges.each do |gap, len|
+        VarInt.write(io, gap)
+        VarInt.write(io, len)
+      end
     end
   end
 

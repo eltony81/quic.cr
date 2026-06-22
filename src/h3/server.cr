@@ -245,8 +245,17 @@ module H3
         buf = Bytes.new(512)
         loop { break if stream.read(buf) == 0 }
       when 0x00  # Control stream: client sends SETTINGS and other control frames
-        buf = Bytes.new(512)
-        loop { break if stream.read(buf) == 0 }
+        loop do
+          begin
+            frame = H3::Frame.decode(stream, nil)
+            case frame
+            when H3::GoAwayFrame
+              h3_conn.peer_goaway_stream_id = frame.stream_id
+            end
+          rescue
+            break
+          end
+        end
       else
         # Unknown stream type — RFC requires ignoring
         buf = Bytes.new(512)

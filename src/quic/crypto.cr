@@ -60,16 +60,25 @@ module QUIC
       # Reusable nonce buffer — reset from @iv before each encrypt/decrypt.
       # Safe because QUIC send/recv runs in a single fiber at a time.
       @nonce : Bytes
+      @algorithm : String
 
-      def initialize(@key, @iv)
+      def initialize(@key, @iv, @algorithm = "AES-128-GCM")
         @nonce = @iv.dup
+      end
+
+      private def openssl_cipher_name : String
+        case @algorithm
+        when "AES-256-GCM"         then "AES-256-GCM"
+        when "CHACHA20-POLY1305"   then "chacha20-poly1305"
+        else                            "AES-128-GCM"
+        end
       end
 
       # Encrypts plaintext and returns ciphertext + 16-byte GCM tag in a single
       # pre-allocated buffer (1 alloc instead of 4+ intermediate concatenations).
       def encrypt(ad : Bytes, pn : UInt64, plaintext : Bytes) : Bytes
         build_nonce(pn)
-        cipher = OpenSSL::Cipher.new("AES-128-GCM")
+        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
         cipher.encrypt
         cipher.key = @key
         cipher.iv = @nonce
@@ -77,13 +86,28 @@ module QUIC
 
         result = Bytes.new(plaintext.size + 16)
         n = cipher.update_into(plaintext, result)
-        cipher.final  # GCM finalization — produces no extra bytes
+        cipher.final  # AEAD finalization — produces no extra bytes
         cipher.gcm_get_tag_into(result, n)
         result
       end
 
-      # Decrypts ciphertext (last 16 bytes = GCM tag) into a single pre-allocated
-      # plaintext buffer (1 alloc instead of 4+ intermediate concatenations).
+      # Encrypts plaintext directly into `out[0, plaintext.size+16]` — zero heap
+      # allocations. Returns total bytes written (plaintext.size + 16 tag).
+      def encrypt_into(ad : Bytes, pn : UInt64, plaintext : Bytes, dst : Bytes) : Int32
+        build_nonce(pn)
+        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
+        cipher.encrypt
+        cipher.key = @key
+        cipher.iv  = @nonce
+        cipher.update_ad(ad)
+        n = cipher.update_into(plaintext, dst)
+        cipher.final
+        cipher.gcm_get_tag_into(dst, n)
+        n + 16
+      end
+
+      # Decrypts ciphertext (last 16 bytes = tag) into a single pre-allocated
+      # plaintext buffer.
       def decrypt(ad : Bytes, pn : UInt64, ciphertext : Bytes) : Bytes
         tag_size = 16
         raise Error.new("Ciphertext too short") if ciphertext.size < tag_size
@@ -92,7 +116,7 @@ module QUIC
         actual_ct = ciphertext[0, ciphertext.size - tag_size]
         tag       = ciphertext[ciphertext.size - tag_size, tag_size]
 
-        cipher = OpenSSL::Cipher.new("AES-128-GCM")
+        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
         cipher.decrypt
         cipher.key = @key
         cipher.iv = @nonce
@@ -160,19 +184,72 @@ module QUIC
       hkdf_expand_label(secret, "ku", Bytes.empty, 32)
     end
 
+    # SHA-384 variants for TLS_AES_256_GCM_SHA384 (RFC 9001 §5.3).
+    def self.hkdf_expand_sha384(secret : Bytes, info : Bytes, length : Int) : Bytes
+      okm = Bytes.new(length)
+      n = (length.to_f / 48).ceil.to_i
+      t = Bytes.empty
+      pos = 0
+      (1..n).each do |i|
+        ctx = IO::Memory.new
+        ctx.write(t)
+        ctx.write(info)
+        ctx.write_byte(i.to_u8)
+        t = OpenSSL::HMAC.digest(OpenSSL::Algorithm::SHA384, secret, ctx.to_slice)
+        copy_len = Math.min(48, length - pos)
+        okm[pos, copy_len].copy_from(t[0, copy_len])
+        pos += copy_len
+      end
+      okm
+    end
+
+    def self.hkdf_expand_label_sha384(secret : Bytes, label : String, context : Bytes, length : Int) : Bytes
+      full_label = "tls13 #{label}"
+      info = IO::Memory.new
+      IO::ByteFormat::NetworkEndian.encode(length.to_u16, info)
+      info.write_byte(full_label.size.to_u8)
+      info.write(full_label.to_slice)
+      info.write_byte(context.size.to_u8)
+      info.write(context)
+      hkdf_expand_sha384(secret, info.to_slice, length)
+    end
+
+    def self.derive_next_secret_sha384(secret : Bytes) : Bytes
+      hkdf_expand_label_sha384(secret, "ku", Bytes.empty, 48)
+    end
+
     class HeaderProtection
       @key : Bytes
+      @algorithm : String
 
-      def initialize(@key)
+      def initialize(@key, @algorithm = "AES-128-ECB")
       end
 
       def mask(sample : Bytes) : Bytes
-        cipher = OpenSSL::Cipher.new("AES-128-ECB")
-        cipher.encrypt
-        cipher.key = @key
-        cipher.padding = false
-        mask = cipher.update(sample)
-        mask + cipher.final
+        case @algorithm
+        when "CHACHA20"
+          # RFC 9001 §5.4.4: counter = LE32(sample[0:4]), nonce = sample[4:16].
+          # OpenSSL chacha20 IV = [counter_le32 | nonce_96bit] = sample[0:16].
+          cipher = OpenSSL::Cipher.new("chacha20")
+          cipher.encrypt
+          cipher.key = @key
+          cipher.iv = sample
+          cipher.update(Bytes.new(5, 0_u8))
+        when "AES-256-ECB"
+          cipher = OpenSSL::Cipher.new("AES-256-ECB")
+          cipher.encrypt
+          cipher.key = @key
+          cipher.padding = false
+          mask = cipher.update(sample)
+          mask + cipher.final
+        else
+          cipher = OpenSSL::Cipher.new("AES-128-ECB")
+          cipher.encrypt
+          cipher.key = @key
+          cipher.padding = false
+          mask = cipher.update(sample)
+          mask + cipher.final
+        end
       end
 
       def apply!(header : Bytes, pn_offset : Int, mask : Bytes, unprotect : Bool)

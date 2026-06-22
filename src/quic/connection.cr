@@ -1076,23 +1076,32 @@ module QUIC
       server_secret = @server_app_secret
       return if client_secret.nil? || server_secret.nil?
 
-      next_client = Crypto.derive_next_secret(client_secret)
-      next_server = Crypto.derive_next_secret(server_secret)
+      _, _, key_len, _, use_sha384 = cipher_suite_info
+      if use_sha384
+        next_client = Crypto.derive_next_secret_sha384(client_secret)
+        next_server = Crypto.derive_next_secret_sha384(server_secret)
+        client_key = Crypto.hkdf_expand_label_sha384(next_client, "quic key", Bytes.empty, key_len)
+        client_iv  = Crypto.hkdf_expand_label_sha384(next_client, "quic iv",  Bytes.empty, 12)
+        server_key = Crypto.hkdf_expand_label_sha384(next_server, "quic key", Bytes.empty, key_len)
+        server_iv  = Crypto.hkdf_expand_label_sha384(next_server, "quic iv",  Bytes.empty, 12)
+      else
+        next_client = Crypto.derive_next_secret(client_secret)
+        next_server = Crypto.derive_next_secret(server_secret)
+        client_key = Crypto.hkdf_expand_label(next_client, "quic key", Bytes.empty, key_len)
+        client_iv  = Crypto.hkdf_expand_label(next_client, "quic iv",  Bytes.empty, 12)
+        server_key = Crypto.hkdf_expand_label(next_server, "quic key", Bytes.empty, key_len)
+        server_iv  = Crypto.hkdf_expand_label(next_server, "quic iv",  Bytes.empty, 12)
+      end
 
       @client_app_secret = next_client
       @server_app_secret = next_server
 
-      client_key = Crypto.hkdf_expand_label(next_client, "quic key", Bytes.empty, 16)
-      client_iv  = Crypto.hkdf_expand_label(next_client, "quic iv", Bytes.empty, 12)
-      server_key = Crypto.hkdf_expand_label(next_server, "quic key", Bytes.empty, 16)
-      server_iv  = Crypto.hkdf_expand_label(next_server, "quic iv", Bytes.empty, 12)
-
       if @is_server
-        @space_app.aead_rx = Crypto::AEAD.new(client_key, client_iv)
-        @space_app.aead_tx = Crypto::AEAD.new(server_key, server_iv)
+        @space_app.aead_rx = make_aead(client_key, client_iv)
+        @space_app.aead_tx = make_aead(server_key, server_iv)
       else
-        @space_app.aead_rx = Crypto::AEAD.new(server_key, server_iv)
-        @space_app.aead_tx = Crypto::AEAD.new(client_key, client_iv)
+        @space_app.aead_rx = make_aead(server_key, server_iv)
+        @space_app.aead_tx = make_aead(client_key, client_iv)
       end
     end
 
@@ -1136,58 +1145,93 @@ module QUIC
       end
     end
 
+    # Returns {aead_name, hp_name, key_len, hp_len, use_sha384} for the
+    # negotiated TLS 1.3 cipher suite (RFC 9001 §5.3).
+    private def cipher_suite_info : {String, String, Int32, Int32, Bool}
+      case @tls.cipher_suite_name
+      when "TLS_AES_256_GCM_SHA384"
+        {"AES-256-GCM", "AES-256-ECB", 32, 32, true}
+      when "TLS_CHACHA20_POLY1305_SHA256"
+        {"CHACHA20-POLY1305", "CHACHA20", 32, 32, false}
+      else
+        {"AES-128-GCM", "AES-128-ECB", 16, 16, false}
+      end
+    end
+
+    private def derive_quic_keys(secret : Bytes) : {Bytes, Bytes, Bytes}
+      aead_name, hp_name, key_len, hp_len, use_sha384 = cipher_suite_info
+      if use_sha384
+        key = Crypto.hkdf_expand_label_sha384(secret, "quic key", Bytes.empty, key_len)
+        iv  = Crypto.hkdf_expand_label_sha384(secret, "quic iv",  Bytes.empty, 12)
+        hp  = Crypto.hkdf_expand_label_sha384(secret, "quic hp",  Bytes.empty, hp_len)
+      else
+        key = Crypto.hkdf_expand_label(secret, "quic key", Bytes.empty, key_len)
+        iv  = Crypto.hkdf_expand_label(secret, "quic iv",  Bytes.empty, 12)
+        hp  = Crypto.hkdf_expand_label(secret, "quic hp",  Bytes.empty, hp_len)
+      end
+      {key, iv, hp}
+    end
+
+    private def make_aead(key : Bytes, iv : Bytes) : Crypto::AEAD
+      aead_name, _, _, _, _ = cipher_suite_info
+      Crypto::AEAD.new(key, iv, aead_name)
+    end
+
+    private def make_hp(hp : Bytes) : Crypto::HeaderProtection
+      _, hp_name, _, _, _ = cipher_suite_info
+      Crypto::HeaderProtection.new(hp, hp_name)
+    end
+
     private def handle_secret(label : String, secret : Bytes)
       Log.trace { "SECRET DERIVATION: label=#{label} secret=#{secret.hexstring}" }
-      key = Crypto.hkdf_expand_label(secret, "quic key", Bytes.empty, 16)
-      iv  = Crypto.hkdf_expand_label(secret, "quic iv", Bytes.empty, 12)
-      hp  = Crypto.hkdf_expand_label(secret, "quic hp", Bytes.empty, 16)
+      key, iv, hp = derive_quic_keys(secret)
 
       case label
       when "CLIENT_EARLY_TRAFFIC_SECRET"
         # 0-RTT write key (client) / read key (server)
         if @is_server
-          @space_zero_rtt.aead_rx = Crypto::AEAD.new(key, iv)
-          @space_zero_rtt.hp_rx   = Crypto::HeaderProtection.new(hp)
+          @space_zero_rtt.aead_rx = make_aead(key, iv)
+          @space_zero_rtt.hp_rx   = make_hp(hp)
         else
-          @space_zero_rtt.aead_tx = Crypto::AEAD.new(key, iv)
-          @space_zero_rtt.hp_tx   = Crypto::HeaderProtection.new(hp)
+          @space_zero_rtt.aead_tx = make_aead(key, iv)
+          @space_zero_rtt.hp_tx   = make_hp(hp)
         end
         Log.trace { "0-RTT keys installed (#{@is_server ? "read" : "write"})" }
       when "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
         @client_handshake_secret = secret
         if @is_server
-          @space_handshake.aead_rx = Crypto::AEAD.new(key, iv)
-          @space_handshake.hp_rx   = Crypto::HeaderProtection.new(hp)
+          @space_handshake.aead_rx = make_aead(key, iv)
+          @space_handshake.hp_rx   = make_hp(hp)
         else
-          @space_handshake.aead_tx = Crypto::AEAD.new(key, iv)
-          @space_handshake.hp_tx   = Crypto::HeaderProtection.new(hp)
+          @space_handshake.aead_tx = make_aead(key, iv)
+          @space_handshake.hp_tx   = make_hp(hp)
         end
       when "SERVER_HANDSHAKE_TRAFFIC_SECRET"
         @server_handshake_secret = secret
         if @is_server
-          @space_handshake.aead_tx = Crypto::AEAD.new(key, iv)
-          @space_handshake.hp_tx   = Crypto::HeaderProtection.new(hp)
+          @space_handshake.aead_tx = make_aead(key, iv)
+          @space_handshake.hp_tx   = make_hp(hp)
         else
-          @space_handshake.aead_rx = Crypto::AEAD.new(key, iv)
-          @space_handshake.hp_rx   = Crypto::HeaderProtection.new(hp)
+          @space_handshake.aead_rx = make_aead(key, iv)
+          @space_handshake.hp_rx   = make_hp(hp)
         end
       when "CLIENT_TRAFFIC_SECRET_0"
         @client_app_secret = secret
         if @is_server
-          @space_app.aead_rx = Crypto::AEAD.new(key, iv)
-          @space_app.hp_rx   = Crypto::HeaderProtection.new(hp)
+          @space_app.aead_rx = make_aead(key, iv)
+          @space_app.hp_rx   = make_hp(hp)
         else
-          @space_app.aead_tx = Crypto::AEAD.new(key, iv)
-          @space_app.hp_tx   = Crypto::HeaderProtection.new(hp)
+          @space_app.aead_tx = make_aead(key, iv)
+          @space_app.hp_tx   = make_hp(hp)
         end
       when "SERVER_TRAFFIC_SECRET_0"
         @server_app_secret = secret
         if @is_server
-          @space_app.aead_tx = Crypto::AEAD.new(key, iv)
-          @space_app.hp_tx   = Crypto::HeaderProtection.new(hp)
+          @space_app.aead_tx = make_aead(key, iv)
+          @space_app.hp_tx   = make_hp(hp)
         else
-          @space_app.aead_rx = Crypto::AEAD.new(key, iv)
-          @space_app.hp_rx   = Crypto::HeaderProtection.new(hp)
+          @space_app.aead_rx = make_aead(key, iv)
+          @space_app.hp_rx   = make_hp(hp)
         end
       end
     end
