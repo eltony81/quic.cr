@@ -100,13 +100,19 @@ module QUIC
         data = Bytes.new(len)
         io.read_fully(data)
         DatagramFrame.new(data)
-      when FrameType::CONNECTION_CLOSE.to_u64
+      when FrameType::CONNECTION_CLOSE.to_u64  # 0x1c: QUIC-layer close (has frame_type field)
         error_code = VarInt.decode(io)
         frame_type = VarInt.decode(io)
         reason_len = VarInt.decode(io)
         reason = Bytes.new(reason_len)
         io.read_fully(reason)
         ConnectionCloseFrame.new(error_code, frame_type, String.new(reason))
+      when 0x1d_u64  # APPLICATION_CLOSE: H3-layer close (no frame_type field per RFC 9000 §19.19)
+        error_code = VarInt.decode(io)
+        reason_len = VarInt.decode(io)
+        reason = Bytes.new(reason_len)
+        io.read_fully(reason)
+        ConnectionCloseFrame.new(error_code, 0_u64, String.new(reason))
       when 0x08_u64..0x0f_u64
         id = VarInt.decode(io)
         offset = (type_val & 0x04) != 0 ? VarInt.decode(io) : 0_u64

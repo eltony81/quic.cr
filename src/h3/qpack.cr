@@ -148,12 +148,13 @@ module H3
           end
         end
 
-        # Header block prefix: RIC + Base (RFC 9204 Section 4.5.1)
-        # RIC = 0 means no dynamic references; RIC = final_ic means all are pre-base.
+        # Header block prefix: RIC + Base (RFC 9204 §4.5.1)
+        # ERIC = 0 when no dynamic refs; else (RIC % (2*MaxEntries)) + 1.
+        # MaxEntries = floor(4096/32) = 128; 2*MaxEntries = 256.
         # Base Delta = 0 (Base == RIC), Sign = 0.
         prefix_io = IO::Memory.new
-        ric = final_ic % 256
-        Integer.encode(prefix_io, ric.to_u64, 8, 0x00_u8)
+        ric = final_ic == 0_u64 ? 0_u64 : (final_ic % 256_u64) + 1_u64
+        Integer.encode(prefix_io, ric, 8, 0x00_u8)
         prefix_io.write_byte 0x00_u8
 
         result = IO::Memory.new
@@ -242,14 +243,27 @@ module H3
         io = IO::Memory.new(bytes)
         return headers if io.size == 0
 
-        # 1. Read Required Insert Count (RIC)
+        # 1. Read Encoded Required Insert Count (ERIC) and convert to RIC (RFC 9204 §4.5.1)
         first = io.read_byte || return headers
-        ric = Integer.decode(io, first, 8)
-        @last_required_insert_count = ric.to_u64
+        eric = Integer.decode(io, first, 8)
+
+        req_insert_count = if eric == 0_u64
+          0_u64
+        else
+          max_entries = @dynamic_table.capacity > 0_u64 ? (@dynamic_table.capacity // 32_u64) : 128_u64
+          full_range  = 2_u64 * max_entries
+          total       = @dynamic_table.insert_count
+          max_val     = total + max_entries
+          max_wrapped = (max_val // full_range) * full_range
+          ric_val     = max_wrapped + eric - 1_u64
+          ric_val -= full_range if ric_val > max_val
+          ric_val
+        end
+        @last_required_insert_count = req_insert_count
 
         # Block if the dynamic table hasn't received enough entries yet (RFC 9204 §2.1.1)
-        if ric > 0 && ric.to_u64 > @dynamic_table.insert_count
-          raise QpackBlockedError.new(ric.to_u64)
+        if req_insert_count > @dynamic_table.insert_count
+          raise QpackBlockedError.new(req_insert_count)
         end
 
         # 2. Read Base
@@ -257,10 +271,9 @@ module H3
         base_sign = (second & 0x80) != 0
         base_delta = Integer.decode(io, second, 7)
 
-        # Base calculation (RFC 9204 Section 4.5.1)
+        # Base calculation (RFC 9204 §4.5.1): Base = RIC + delta (or RIC - delta - 1 if sign bit set)
         base = 0_u64
-        if ric > 0
-          req_insert_count = ric.to_u64 # Simplified RIC mapping
+        if req_insert_count > 0
           if !base_sign
             base = req_insert_count + base_delta.to_u64
           else

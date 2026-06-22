@@ -14,10 +14,12 @@ module QUIC
 
     def listen
       buffer = Bytes.new(2048)
+      out_buf = Bytes.new(2048)
+      batch_sender = BatchSender.new(@socket)
       loop do
         size, client_addr = @socket.receive(buffer)
         data = buffer[0, size]
-        
+
         begin
           io = IO::Memory.new(data)
           first_byte = io.read_byte.not_nil!
@@ -106,12 +108,12 @@ module QUIC
           end
           
           conn.recv(data)
-          
-          # 3. Check for outgoing data
-          out_buf = Bytes.new(2048)
-          while (out_size = conn.send(out_buf)) > 0
-            @socket.send(out_buf[0, out_size], client_addr)
+
+          # 3. Drain outgoing packets into batch; flush via sendmmsg
+          while (out_size = conn.send_coalesced(out_buf)) > 0
+            batch_sender.add(out_buf[0, out_size], client_addr)
           end
+          batch_sender.flush
           
           # 4. Cleanup closed connections
           @connections.delete(conn_key) if conn.closed?

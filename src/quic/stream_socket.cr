@@ -13,7 +13,7 @@ module QUIC
         
         # Check stream state
         if stream = @connection.streams[@stream_id]?
-          if stream.state == StreamState::Closed || stream.state == StreamState::HalfClosedRemote
+          if stream.state == StreamState::Closed || stream.state == StreamState::HalfClosedRemote || stream.state == StreamState::Reset
             return 0
           end
         else

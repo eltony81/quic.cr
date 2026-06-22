@@ -4,12 +4,15 @@ require "./qpack"
 
 module H3
   class Client
+    Log = ::Log.for("H3::Client")
+
     getter quic_conn : QUIC::Connection
     getter h3_conn : H3::Connection
     @socket : UDPSocket
     @remote_addr : Socket::IPAddress
     @connected : Bool = false
     @handled_server_streams = Set(UInt64).new
+    @pump_buf = Bytes.new(65536)
 
     def initialize(host : String, port : Int32, config : QUIC::Config)
       @remote_addr = Socket::IPAddress.new(host, port)
@@ -149,8 +152,7 @@ module H3
             resp_body.write(f.data)
           end
         rescue e
-          STDERR.puts "Frame decode error: #{e.class} - #{e.message}"
-          STDERR.puts e.backtrace.join("\n")
+          Log.debug { "frame decode error: #{e.class} — #{e.message}" }
           break
         end
       end
@@ -223,11 +225,10 @@ module H3
     end
     
     private def pump_send
-      out_buf = Bytes.new(65536)
       loop do
-        bytes_sent = @quic_conn.send(out_buf)
+        bytes_sent = @quic_conn.send(@pump_buf)
         break if bytes_sent == 0
-        @socket.send(out_buf[0, bytes_sent])
+        @socket.send(@pump_buf[0, bytes_sent])
       end
     end
   end
