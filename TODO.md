@@ -56,6 +56,12 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement PTO (Probe Timeout) timers.
   - [x] Logic to clone and retransmit lost stream/crypto frames.
   - [x] Full ACK range processing (all ranges, not just first) per RFC 9002 Section 2.3.
+  - [ ] **Loss Detection Timer (RFC 9002 §6.2)**: attualmente `detect_lost_packets` è
+        chiamato ogni 10ms dal `tick()` (fix anti-false-positive). Sostituire con un
+        timer dedicato: `@loss_time = oldest_unacked.time_sent + loss_delay`. Il timer
+        si aggiorna in `on_ack_received` e si valuta in `tick()`; si cancella se lo
+        spazio è vuoto. Questo eliminerebbe il delay fisso di 10ms per ciclo che
+        oggi penalizza il 1MB di ~55ms rispetto a quic-go.
 - [x] **Flow Control Enforcement**:
   - [x] Track local and remote `MAX_DATA` correctly across the connection.
   - [x] Track `MAX_STREAM_DATA` for individual streams.
