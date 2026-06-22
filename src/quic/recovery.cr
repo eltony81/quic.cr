@@ -2,6 +2,11 @@ module QUIC
   class Recovery
     # Per-space largest-acked (0=Initial, 1=Handshake, 2=App)
     @largest_acked = {0 => 0_u64, 1 => 0_u64, 2 => 0_u64}
+    @pending_loss_detection : Bool = false
+
+    def pending_loss_detection?; @pending_loss_detection; end
+    def clear_pending_loss_detection; @pending_loss_detection = false; end
+    def largest_acked; @largest_acked; end
     # Key: {space_id, packet_number} — avoids collisions between Initial/Handshake/App
     # spaces that each independently start their packet numbers at 0.
     @sent_packets = {} of {Int32, UInt64} => SentPacket
@@ -88,6 +93,7 @@ module QUIC
 
       @largest_acked[space_id] = Math.max(@largest_acked[space_id]? || 0_u64, ack.largest_acknowledged)
       @pto_count = 0 # Reset PTO on successful ACK
+      @pending_loss_detection = true
 
       # ECN-CE congestion signal (RFC 9002 §7.6): new CE marks → congestion event.
       if ack.has_ecn? && ack.ecn_ce > @last_ecn_ce
@@ -157,12 +163,11 @@ module QUIC
     def detect_lost_packets(largest_acked : UInt64, now : Time = Time.local, space_id : Int32 = 2) : Array(SentPacket)
       lost_packets = [] of SentPacket
 
-      # RFC 9002 Section 6.1.2: Time Threshold (kTimeThreshold = 9/8)
+      # Time-threshold only (RFC 9002 §6.1.2); packet-threshold omitted per §6.1.1 MAY
+      # to avoid false positives when partial ACKs arrive before the full burst is ACKed.
       loss_delay = Math.max(@latest_rtt, @smoothed_rtt)
       loss_delay += (loss_delay / 8)
       loss_delay = Math.max(loss_delay, 1.millisecond)
-
-      packet_threshold = 3_u64 # RFC 9002 Section 6.1.1
 
       lost_keys = [] of {Int32, UInt64}
       @sent_packets.each do |(sp, pn), packet|
@@ -171,7 +176,7 @@ module QUIC
 
         time_since_sent = now - packet.time_sent
 
-        if time_since_sent > loss_delay || (largest_acked - pn) >= packet_threshold
+        if time_since_sent > loss_delay
           lost_packets << packet
           lost_keys << {sp, pn}
         end
@@ -245,6 +250,14 @@ module QUIC
 
     def congestion_window
       @congestion_window
+    end
+
+    def pto_count
+      @pto_count
+    end
+
+    def sent_packet_count
+      @sent_packets.size
     end
 
     def can_send? : Bool

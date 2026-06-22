@@ -72,6 +72,10 @@ module H3
             end
             break unless drained
           end
+          # Forward after the full drain so stream buffers accumulate across
+          # the whole packet batch — reduces channel sends from O(packets) to
+          # O(MB / 64KB) ≈ 16 sends for 1MB instead of ~680.
+          forward_stream_data
           flush_outgoing
 
         when resp = @response_chan.receive
@@ -117,7 +121,6 @@ module H3
       end
 
       dispatch_new_streams
-      forward_stream_data
     end
 
     private def handle_response(stream_id : UInt64, data : Bytes)

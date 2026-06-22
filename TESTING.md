@@ -175,35 +175,36 @@ python3 bench/benchmark.py          # default: 30 round per scenario
 python3 bench/benchmark.py -n 100   # più round per statistiche più stabili
 ```
 
-Output atteso (valori indicativi da loopback):
+Output atteso (valori indicativi da loopback, benchmark con overhead aioquic GC ~120ms incluso):
 
 ```
 ==========================================================================================
   HTTP/3 Benchmark: quic.cr (Crystal, :4433) vs quic-go (Go, :4434)
-  30 sequential requests per scenario (one connection per request)
+  10 sequential requests per scenario (one connection per request)
 ==========================================================================================
-
-  Running: A. GET /  [Crystal] (30 rounds)... done
-  Running: A. GET /  [Go] (30 rounds)... done
-  ...
 
 ──────────────────────────────────────────────────────────────────────────────────────────
   RESULTS
 ──────────────────────────────────────────────────────────────────────────────────────────
-  A. GET /  [Crystal]                           mean=  2.1ms  p50=  1.9ms  p95=  3.4ms  rps= 476.2  err=0
-  A. GET /  [Go]                                mean=  3.8ms  p50=  3.5ms  p95=  6.1ms  rps= 263.2  err=0
-  B. POST /echo 20B [Crystal]                   mean=  2.3ms  p50=  2.1ms  p95=  3.7ms  rps= 434.8  err=0
-  B. POST /echo 20B [Go]                        mean=  4.1ms  p50=  3.9ms  p95=  6.4ms  rps= 243.9  err=0
-  C. POST /echo 1MB [Crystal]                   mean= 18.4ms  p50= 17.2ms  p95= 28.1ms  rps=  54.3  err=0
-  C. POST /echo 1MB [Go]                        mean= 22.7ms  p50= 21.5ms  p95= 31.9ms  rps=  44.1  err=0
+  A. GET /  [Crystal]                           mean=126.4ms  p50=125.1ms  p95=134.9ms  rps=  7.9  err=0
+  A. GET /  [Go]                                mean=121.8ms  p50=120.8ms  p95=129.7ms  rps=  8.2  err=0
+  B. POST /echo 20B [Crystal]                   mean=126.8ms  p50=125.0ms  p95=137.3ms  rps=  7.9  err=0
+  B. POST /echo 20B [Go]                        mean=120.6ms  p50=120.9ms  p95=125.8ms  rps=  8.3  err=0
+  C. POST /echo 1MB [Crystal]                   mean=346.5ms  p50=335.4ms  p95=392.3ms  rps=  2.9  err=0
+  C. POST /echo 1MB [Go]                        mean=287.2ms  p50=279.9ms  p95=324.3ms  rps=  3.5  err=0
 
 ──────────────────────────────────────────────────────────────────────────────────────────
   SPEEDUP  (Crystal mean / Go mean — >1 means Crystal is faster)
 ──────────────────────────────────────────────────────────────────────────────────────────
-  GET /                  Crystal  2.1ms  Go  3.8ms  → Crystal is 1.81× faster
-  POST /echo 20B         Crystal  2.3ms  Go  4.1ms  → Crystal is 1.78× faster
-  POST /echo 1MB         Crystal 18.4ms  Go 22.7ms  → Crystal is 1.23× faster
+  GET /                  Crystal 126.4ms  Go 121.8ms  → Go is 1.04× faster
+  POST /echo 20B         Crystal 126.8ms  Go 120.6ms  → Go is 1.05× faster
+  POST /echo 1MB         Crystal 346.5ms  Go 287.2ms  → Go is 1.21× faster
 ```
 
-> Il vantaggio di Crystal è maggiore sui piccoli payload (handshake + scheduling più leggero)
-> e si riduce su payload grandi dove la larghezza di banda diventa il collo di bottiglia.
+> Nota: il benchmark Python (aioquic) introduce ~120ms di overhead fisso per connessione
+> dovuto alle GC exceptions di Python 3.14. Per misurare la latenza reale, usare il
+> test diretto in Python (vedi sotto) o un client HTTP/3 nativo come curl.
+>
+> Latenza diretta misurata (asyncio.sleep=1ms, escluso overhead benchmark):
+> - GET Crystal ~5-10ms, Go ~3ms
+> - POST 1MB Crystal ~190ms, Go ~135ms

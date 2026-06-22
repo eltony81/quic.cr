@@ -105,15 +105,17 @@ async def bench(label: str, port: int, path: str,
     if not latencies:
         return {"label": label, "error": "all requests failed"}
 
+    s = sorted(latencies)
     return {
         "label":   label,
         "rounds":  rounds,
         "errors":  errors,
-        "min_ms":  min(latencies),
-        "max_ms":  max(latencies),
+        "min_ms":  s[0],
+        "max_ms":  s[-1],
         "mean_ms": statistics.mean(latencies),
         "p50_ms":  statistics.median(latencies),
-        "p95_ms":  sorted(latencies)[int(len(latencies) * 0.95)],
+        "p95_ms":  s[int(len(s) * 0.95)],
+        "p99_ms":  s[int(len(s) * 0.99)],
         "rps":     1000.0 / statistics.mean(latencies),
     }
 
@@ -126,6 +128,7 @@ def fmt(r: dict) -> str:
         f"mean={r['mean_ms']:6.1f}ms  "
         f"p50={r['p50_ms']:6.1f}ms  "
         f"p95={r['p95_ms']:6.1f}ms  "
+        f"p99={r['p99_ms']:6.1f}ms  "
         f"rps={r['rps']:6.1f}  "
         f"err={r['errors']}"
     )

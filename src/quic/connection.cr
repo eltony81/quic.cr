@@ -194,14 +194,25 @@ module QUIC
     def tick(now : Time = Time.local)
       if timeout = @recovery.timeout
         if now >= timeout
-          Log.trace { "PTO EXPIRED! Requeuing unacknowledged packets." }
-          lost_pkts = @recovery.on_pto_timeout
-          lost_pkts.each do |pkt|
-            pkt.frames.each do |f|
-              if f.is_a?(StreamFrame) || f.is_a?(CryptoFrame) || f.is_a?(MaxDataFrame) || f.is_a?(MaxStreamDataFrame) || f.is_a?(DatagramFrame)
-                @lost_frames << f
-              end
-            end
+          Log.trace { "PTO expired: requeuing #{@recovery.sent_packet_count} packets" }
+          queue_lost_frames(@recovery.on_pto_timeout)
+        end
+      end
+
+      # Timer-based loss detection per RFC 9002 §6.1: run once per tick so that
+      # all ACKs from the current asyncio batch are processed before declaring loss.
+      if @recovery.pending_loss_detection? && @tls.handshake_complete?
+        @recovery.clear_pending_loss_detection
+        la = @recovery.largest_acked[2]? || 0_u64
+        queue_lost_frames(@recovery.detect_lost_packets(la, space_id: 2)) if la > 0
+      end
+    end
+
+    private def queue_lost_frames(lost_pkts : Array(Recovery::SentPacket))
+      lost_pkts.each do |pkt|
+        pkt.frames.each do |f|
+          if f.is_a?(StreamFrame) || f.is_a?(CryptoFrame) || f.is_a?(MaxDataFrame) || f.is_a?(MaxStreamDataFrame) || f.is_a?(DatagramFrame)
+            @lost_frames << f
           end
         end
       end
@@ -504,17 +515,8 @@ module QUIC
       when AckFrame
         sid = space_id(space)
         @paths.each { |p| p.recovery.on_ack_received(frame, space_id: sid) }
-
-        # Trigger loss detection
-        lost_pkts = @recovery.detect_lost_packets(frame.largest_acknowledged, space_id: sid)
-        lost_pkts.each do |pkt|
-          pkt.frames.each do |f|
-            # Retransmit data-bearing frames
-            if f.is_a?(StreamFrame) || f.is_a?(CryptoFrame) || f.is_a?(MaxDataFrame) || f.is_a?(MaxStreamDataFrame) || f.is_a?(DatagramFrame)
-              @lost_frames << f
-            end
-          end
-        end
+        # Loss detection is deferred to tick() to avoid false positives from
+        # partial ACKs that arrive before all packets in a burst are acknowledged.
 
         if (pn = @pmtud_probe_pn) && (frame.largest_acknowledged - frame.first_ack_range .. frame.largest_acknowledged).includes?(pn)
           @path_mtu = @pmtud_probe_sent_size
