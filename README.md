@@ -1,69 +1,334 @@
-# quic
+# quic.cr
 
-TODO: Write a description here
+A pure-Crystal HTTP/3 and QUIC implementation.  No external Crystal shard dependencies.
 
-## Installation
+Crystal >= 1.20.2 required.  TLS is handled through OpenSSL via LibSSL's native QUIC API.
 
-1. Add the dependency to your `shard.yml`:
+---
 
-   ```yaml
-   dependencies:
-     quic:
-       github: your-github-user/quic.cr
-   ```
+## Quick start
 
-2. Run `shards install`
+```bash
+# Run the example routed HTTP/3 server
+crystal run examples/h3_server_routed.cr
 
-## Usage
+# Send a request (requires curl with HTTP/3 support)
+curl -v --http3 https://127.0.0.1:4433/ --insecure
+curl -v --http3 https://127.0.0.1:4433/users/42 --insecure
+curl -v --http3 -X POST -d '{"msg":"hello"}' -H "Content-Type: application/json" \
+     https://127.0.0.1:4433/echo --insecure
+```
+
+TLS certificates for local development are at `cert.pem` / `key.pem` (repo root).
+
+---
+
+## Router API
 
 ```crystal
-require "quic"
+require "../src/quic"
+
+router = H3::Router.new
+
+# Middleware (runs in insertion order)
+router.use do |ctx, next_handler|
+  Log.info { "#{ctx.request.method} #{ctx.request.path}" }
+  next_handler.call(ctx)
+end
+
+# Routes
+router.get "/"           { |ctx| ctx.html "<h1>Hello HTTP/3!</h1>" }
+router.get "/users/:id"  { |ctx| ctx.json %({"id":"#{ctx.request.path_params["id"]}"}) }
+router.post "/echo"      { |ctx| ctx.text ctx.body_string }
+
+H3::Server.new(router).listen(
+  host: "0.0.0.0", port: 4433,
+  cert: "cert.pem", key: "key.pem"
+)
 ```
 
-To test the library, you can run the example HTTP/3 Server:
+---
+
+## Running the validation tests
+
+The validation suite checks interoperability between the Crystal server/client and
+aioquic (Python HTTP/3).  It requires a Python virtualenv with aioquic installed.
 
 ```bash
-crystal run examples/http3_server.cr
+# Set up the Python environment once
+python3 -m venv venv
+source venv/bin/activate
+pip install aioquic
+
+# Run all interoperability tests
+source venv/bin/activate
+python examples/validate_cross_tests.py
 ```
 
-Then, from another terminal, use `curl` to make HTTP/3 requests:
+### What the tests cover
 
-**GET Request:**
+**Phase 1 — Python client → Crystal server (10 cases)**
+
+| # | Test | What it checks |
+|---|------|----------------|
+| 1 | GET / | Basic HTML response |
+| 2 | GET /greet?name=… | Query-string routing |
+| 3 | GET /users/123 | Path-parameter routing |
+| 4 | POST /echo (JSON) | Request body parsing & echo |
+| 5 | DELETE /users/99 | Method routing |
+| 6 | Custom headers | CORS / middleware headers |
+| 7 | GET /non_existent | 404 handling |
+| 8 | POST /echo (1 MB) | Large-payload transfer |
+| 9 | 3 sequential requests | QPACK encoder state |
+| 10 | PATH_CHALLENGE | Connection migration handling |
+
+**Phase 2 — Crystal client → Python server (8 cases)**
+
+Mirrors Phase 1 in reverse to validate the Crystal HTTP/3 client.
+
+### Expected output
+
+```
+============================================================
+🧪 PHASE 1: Running Interoperability Tests against Crystal Routed Server
+============================================================
+🚀 Starting examples/h3_server_routed...
+👉 Case 1: GET /
+   ✅ PASS
+👉 Case 2: GET /greet?name=Interoperability
+   ✅ PASS
+...
+👉 Case 10: Connection Migration — PATH_CHALLENGE/PATH_RESPONSE transparent handling
+   ✅ PASS (server transparently handled path validation)
+🔌 Crystal Server terminated.
+
+============================================================
+🧪 PHASE 2: Running Crystal Client against Python Server (aioquic)
+============================================================
+...
+🎉 ALL HTTP/3 INTEROPERABILITY & STRESS TESTS COMPLETED SUCCESSFULLY!
+```
+
+---
+
+## Running the benchmark
+
+The benchmark measures TPS (requests/second) and latency percentiles for three scenarios:
+`GET /`, `POST /echo` with a 20-byte body, and `POST /echo` with a 1 MB body.
+
 ```bash
-curl -v --http3 "https://127.0.0.1:4433" --insecure
+# Build the server (release mode for accurate numbers)
+crystal build examples/h3_server_routed.cr -o examples/h3_server_routed --release
+
+# Start the server
+CRYSTAL_LOG_LEVEL=WARN ./examples/h3_server_routed &
+
+# Run the benchmark
+source venv/bin/activate
+python examples/benchmark_concurrent.py --conns 8 --reps 3
+
+# Multi-threaded build (experimental)
+crystal build examples/h3_server_routed.cr -o examples/h3_server_routed_mt \
+       --release -Dpreview_mt
+CRYSTAL_LOG_LEVEL=WARN ./examples/h3_server_routed_mt &
+python examples/benchmark_concurrent.py --port 4433 --conns 8 --reps 3
 ```
 
-**POST Request:**
-```bash
-curl -v --http3 -X POST -d '{"name": "quic.cr"}' -H "Content-Type: application/json" "https://127.0.0.1:4433/api/data" --insecure
+### Benchmark options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port` | 4433 | Server port |
+| `--conns` | 8 | Concurrent connections per round |
+| `--reps` | 3 | Repetitions per scenario |
+
+### Expected output
+
+```
+════════════════════════════════════════════════════════
+  quic.cr HTTP/3 benchmark
+  Port 4433  │  8 concurrent conns  │  3 reps each
+════════════════════════════════════════════════════════
+  Warming up… done
+
+  ┌─ GET  /           (8×3 = 24 reqs)
+  │  Requests : 24/24 OK
+  │  TPS      : 42.1 req/s
+  │  Latency  : avg=107ms  p50=105ms  p95=130ms  p99=145ms  max=158ms
+  └─────────────────────────────────────────────────
+
+  ┌─ POST /echo  20B  (8×3 = 24 reqs)
+  │  Requests : 24/24 OK
+  │  TPS      : 43.8 req/s
+  │  Latency  : avg=103ms  p50=101ms  p95=125ms  p99=138ms  max=152ms
+  └─────────────────────────────────────────────────
+
+  ┌─ POST /echo  1MB  (8×3 = 24 reqs)
+  │  Requests : 24/24 OK
+  │  TPS      : 5.2 req/s
+  │  Latency  : avg=1540ms  p50=1480ms  p95=2100ms  p99=2350ms  max=2700ms
+  └─────────────────────────────────────────────────
 ```
 
-**PUT Request:**
-```bash
-curl -v --http3 -X PUT -d '{"updated": true}' -H "Content-Type: application/json" "https://127.0.0.1:4433/api/data" --insecure
+> **Note on latency**: each request opens a fresh QUIC connection (TLS handshake ~50 ms on
+> loopback).  The 100 ms+ baseline per request reflects handshake time, not application
+> processing time.  Persistent-connection benchmarking (multiple H3 streams per connection)
+> would show much lower per-request latency.
+
+---
+
+## RFC / IETF compliance
+
+The following standards are implemented.  Partial support is noted inline.
+
+### QUIC Transport — RFC 9000
+
+| Clause | Feature |
+|--------|---------|
+| §2 | Variable-length integer (VarInt) encoding |
+| §3.4 | `RESET_STREAM` — abrupt stream termination |
+| §3.5 | `STOP_SENDING` — request peer to stop sending |
+| §4.1 | Connection-level flow control (`MAX_DATA`, `DATA_BLOCKED`) |
+| §4.2 | Stream-level flow control (`MAX_STREAM_DATA`, `STREAM_DATA_BLOCKED`) |
+| §4.6 | Stream count limits (`MAX_STREAMS`, `STREAMS_BLOCKED`) |
+| §5.1 | Connection IDs (initial + server-issued alternatives) |
+| §6 | Version negotiation packet |
+| §8.1 | Address validation — stateless Retry with HMAC-SHA256 token |
+| §8.1 | Retry Integrity Tag (AES-128-GCM, fixed RFC 9001 §5.8 key) |
+| §9.4 | Path validation (`PATH_CHALLENGE` / `PATH_RESPONSE`) |
+| §9.6 | Active connection migration with path re-validation |
+| §12.2 | Coalesced packets (Initial + Handshake + 1-RTT in one UDP datagram) |
+| §14.1 | Client Initial packet padded to ≥ 1200 bytes |
+| §17 | Long-header packets (Initial, Handshake, 0-RTT, Retry) |
+| §17 | Short-header (1-RTT) packets |
+| §19 | All standard frame types: `PADDING`, `PING`, `CRYPTO`, `ACK`, `ACK_ECN`, `STREAM`, `MAX_DATA`, `MAX_STREAM_DATA`, `MAX_STREAMS`, `DATA_BLOCKED`, `STREAM_DATA_BLOCKED`, `STREAMS_BLOCKED`, `NEW_CONNECTION_ID`, `RETIRE_CONNECTION_ID`, `PATH_CHALLENGE`, `PATH_RESPONSE`, `CONNECTION_CLOSE`, `HANDSHAKE_DONE`, `NEW_TOKEN`, `RESET_STREAM`, `STOP_SENDING` |
+
+### TLS 1.3 for QUIC — RFC 9001
+
+| Clause | Feature |
+|--------|---------|
+| §4.4 | TLS handshake via OpenSSL QUIC-native BIO (`SSL_set_quic_tls_cbs`) |
+| §4.9.2 | `HANDSHAKE_DONE` frame — server confirmation + key discard |
+| §5.2 | Initial secret derivation (`INITIAL_SALT_V1`, HKDF-Extract/Expand) |
+| §5.3 | AEAD algorithms: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256` |
+| §5.4 | Header protection (AES-128-ECB / AES-256-ECB / ChaCha20) |
+| §5.5 | Packet number space separation (Initial / Handshake / 0-RTT / 1-RTT) |
+| §5.8 | Retry Integrity Tag (AES-128-GCM, fixed key+nonce) |
+| §6 | Key Update (`trigger_key_update` — derive next-generation traffic secrets) |
+| §7 | 0-RTT early data (encrypt/decrypt 0-RTT packet number space) |
+| §8 | TLS session resumption (NewSessionTicket, session cache) |
+
+### Loss Detection and Congestion Control — RFC 9002
+
+| Clause | Feature |
+|--------|---------|
+| §5.3 | RTT estimation: `latest_rtt`, `smoothed_rtt` (EWMA), `rttvar` |
+| §6.1 | Packet loss detection — time threshold (×9/8 SRTT) and packet threshold (≥3) |
+| §6.2 | PTO (Probe Timeout) timers with exponential backoff (capped at 8×) |
+| §7 | NewReno congestion control (slow start, congestion avoidance, recovery) |
+| §7.6 | `ACK_ECN` frame decoding; persistent congestion detection and response |
+| — | BBR congestion control (alternative, enabled via `bbr_enabled=true`) |
+
+### HTTP/3 — RFC 9114
+
+| Clause | Feature |
+|--------|---------|
+| §4.1 | HTTP request/response lifecycle (HEADERS + DATA frames) |
+| §4.3 | Mandatory header field ordering and pseudo-header validation |
+| §6.1 | Bidirectional request streams (client-initiated, ID mod 4 = 0) |
+| §6.2 | Unidirectional streams: control (type 0x00), QPACK encoder (0x02), QPACK decoder (0x03) |
+| §6.2.1 | Control stream + `SETTINGS` frame sent on handshake completion |
+| §7.2 | Frame types: `DATA`, `HEADERS`, `SETTINGS`, `PUSH_PROMISE` (reject), `GOAWAY` |
+| §7.2.6 | `GOAWAY` — graceful shutdown with last-processed stream ID |
+| §8 | Error codes (`H3_NO_ERROR`, `H3_GENERAL_PROTOCOL_ERROR`, `H3_FRAME_UNEXPECTED`, `H3_ID_ERROR`, `H3_SETTINGS_ERROR`, `H3_MISSING_SETTINGS`, `H3_MESSAGE_ERROR`) |
+
+### QPACK Header Compression — RFC 9204
+
+| Clause | Feature |
+|--------|---------|
+| §2 | Static table (99 entries, RFC 9204 Appendix A) |
+| §3.2.2 | Dynamic table capacity — `Set Dynamic Table Capacity` encoder instruction |
+| §3.2.4 | Dynamic table entry eviction on capacity reduction |
+| §4.5 | Static table indexed field lines |
+| §4.5.2 | Literal field lines with name reference |
+| §4.5.6 | Literal field lines without name reference |
+| §4.6 | Header block prefix (Required Insert Count + Base) |
+| — | Encoder stream instructions (insert with static/dynamic name ref, insert without name ref) |
+| — | Decoder stream instructions (Section Acknowledgment, Insert Count Increment) |
+| — | Huffman string encoding/decoding (per RFC 7541 §5.2) |
+| — | Blocked stream handling (wait for dynamic table sync before decoding) |
+
+### Extensions
+
+| RFC / Draft | Feature |
+|-------------|---------|
+| RFC 7541 | Huffman coding (used by QPACK) |
+| RFC 8701 | QUIC greasing — reserved frame/transport-parameter IDs |
+| RFC 9221 | Unreliable QUIC Datagram extension (`DATAGRAM` frames, type 0x30/0x31) |
+| RFC 9297 | HTTP Datagrams — Quarter Stream ID prefix, `H3_DATAGRAM` SETTINGS (0x33) |
+| RFC 9218 | Extensible Prioritization Scheme — `PRIORITY_UPDATE` frame parse (0xF0700/0xF0701) |
+| Draft Multipath | Multi-path QUIC — per-path congestion control, active path selection |
+
+### Path MTU Discovery
+
+Custom implementation: PMTUD probes via oversized `PING`-padded packets; MTU ratchets up on ACK, stays on loss.
+
+---
+
+## Architecture
+
+Two layers: a QUIC transport layer (`src/quic/`) and an HTTP/3 layer (`src/h3/`).
+
+```
+src/
+├── quic/
+│   ├── connection.cr     # QUIC state machine (sans-I/O)
+│   ├── tls.cr            # LibSSL QUIC-native BIO wrapper
+│   ├── crypto.cr         # AEAD (AES-128/256-GCM, ChaCha20-Poly1305) + header protection
+│   ├── recovery.cr       # Loss detection & congestion control (NewReno / BBR)
+│   ├── stream.cr         # QUIC stream state machine
+│   └── server.cr         # Low-level UDP server (not used by H3::Server)
+└── h3/
+    ├── server.cr          # H3::Server + actor-per-connection dispatcher
+    ├── connection_actor.cr# Per-connection fiber (one per QUIC connection)
+    ├── connection.cr      # HTTP/3 framing over QUIC streams
+    ├── router.cr          # H3::Router — middleware + named-param routing
+    ├── context.cr         # H3::Context (request + response per handler call)
+    ├── request.cr         # H3::Request
+    ├── response.cr        # H3::Response
+    └── qpack/             # QPACK header compression (static table, Huffman)
 ```
 
-**PATCH Request:**
-```bash
-curl -v --http3 -X PATCH -d '{"patched": true}' -H "Content-Type: application/json" "https://127.0.0.1:4433/api/data" --insecure
-```
+The QUIC core follows a **sans-I/O** design: `QUIC::Connection` never owns a socket.
+Callers feed UDP datagrams in via `connection.recv(bytes)` and drain outgoing bytes via
+`connection.send(buf)`.  Each HTTP/3 connection is owned by a dedicated `ConnectionActor`
+fiber; with `-Dpreview_mt` actors run on multiple OS threads without mutexes.
 
-**DELETE Request:**
-```bash
-curl -v --http3 -X DELETE "https://127.0.0.1:4433/api/data/1" --insecure
-```
+---
+
 ## Development
 
-TODO: Write development instructions here
+```bash
+# Run all specs
+crystal spec
+
+# Run a single spec file
+crystal spec spec/h3_spec.cr
+
+# Build & run an example
+crystal build examples/h3_server_routed.cr -o examples/h3_server_routed
+./examples/h3_server_routed
+```
+
+See `TODO.md` for known limitations and planned work.
+
+---
 
 ## Contributing
 
-1. Fork it (<https://github.com/your-github-user/quic.cr/fork>)
-2. Create your feature branch (`git checkout -b my-new-feature`)
-3. Commit your changes (`git commit -am 'Add some feature'`)
-4. Push to the branch (`git push origin my-new-feature`)
-5. Create a new Pull Request
+1. Fork → feature branch → commit → pull request.
+2. Run `crystal spec` and `python examples/validate_cross_tests.py` before opening a PR.
 
-## Contributors
+## License
 
-- [tony](https://github.com/your-github-user) - creator and maintainer
+MIT
