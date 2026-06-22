@@ -70,6 +70,13 @@ module QUIC
     getter max_streams_bidi_remote : UInt64 = 0_u64
     getter max_streams_uni_remote  : UInt64 = 0_u64
 
+    # Inbound stream grant we have issued to the peer (RFC 9000 §4.6).
+    # Replenished dynamically: when the peer has consumed ≥50% of the current limit,
+    # we raise it by initial_max_streams_bidi and queue a MAX_STREAMS frame.
+    @max_streams_bidi_local   : UInt64 = 128_u64  # overwritten in initialize from config
+    @peer_streams_bidi_opened : UInt64 = 0_u64    # highest peer-initiated bidi ordinal seen
+    @pending_max_streams_bidi : UInt64 = 0_u64    # >0 → emit MAX_STREAMS on next send
+
     # Server queues one HANDSHAKE_DONE frame immediately after handshake completes.
     @pending_handshake_done : Bool = false
     @handshake_notified     : Bool = false
@@ -168,6 +175,7 @@ module QUIC
         handle_secret(label, secret)
       }
       @max_data_local = @config.initial_max_data
+      @max_streams_bidi_local = @config.initial_max_streams_bidi
       unless @is_server
         # Populate transport parameters for the client
         tp = TransportParameters.new
@@ -463,9 +471,17 @@ module QUIC
         Log.trace { "RECV CRYPTO FRAME: offset=#{frame.offset} size=#{frame.data.size}" }
         handle_crypto_frame(frame, space)
       when StreamFrame
+        is_new_peer_bidi = (frame.id % 4 == (@is_server ? 0_u64 : 1_u64)) && !@streams.has_key?(frame.id)
         stream = @streams[frame.id] ||= begin
           max_remote, max_local = initial_stream_limits(frame.id)
           Stream.new(frame.id, max_remote, max_local)
+        end
+        if is_new_peer_bidi
+          ordinal = (frame.id >> 2) + 1_u64
+          if ordinal > @peer_streams_bidi_opened
+            @peer_streams_bidi_opened = ordinal
+            maybe_extend_max_streams_bidi
+          end
         end
         
         if @data_received + frame.data.size > @max_data_local
@@ -557,6 +573,11 @@ module QUIC
           @max_streams_bidi_remote = Math.max(@max_streams_bidi_remote, frame.maximum_streams)
         else
           @max_streams_uni_remote = Math.max(@max_streams_uni_remote, frame.maximum_streams)
+        end
+      when StreamsBlockedFrame
+        # RFC 9000 §4.6: peer is about to exhaust its bidi stream quota — extend immediately.
+        if frame.bidirectional
+          maybe_extend_max_streams_bidi
         end
       when ConnectionCloseFrame
         Log.trace { "RECV ConnectionCloseFrame: error_code=0x#{frame.error_code.to_s(16)} reason=#{frame.reason}" }
@@ -870,6 +891,11 @@ module QUIC
         end
         @pending_max_stream_data.clear
 
+        if @pending_max_streams_bidi > 0
+          packet.frames << MaxStreamsFrame.new(@pending_max_streams_bidi, true)
+          @pending_max_streams_bidi = 0_u64
+        end
+
         # HANDSHAKE_DONE: server tells client the handshake is confirmed, then
         # discards Initial and Handshake keys (RFC 9001 §4.9.2).
         if @pending_handshake_done && @is_server && space == @space_app
@@ -1012,6 +1038,16 @@ module QUIC
       end
 
       {max_remote, max_local}
+    end
+
+    # Raises the inbound bidi stream limit by initial_max_streams_bidi whenever the
+    # peer has consumed ≥50% of the current grant.  Queues a MAX_STREAMS frame so
+    # the peer never has to block on STREAMS_BLOCKED (RFC 9000 §4.6).
+    private def maybe_extend_max_streams_bidi
+      if @peer_streams_bidi_opened * 2 >= @max_streams_bidi_local
+        @max_streams_bidi_local += @config.initial_max_streams_bidi
+        @pending_max_streams_bidi = @max_streams_bidi_local
+      end
     end
 
     private def check_and_apply_remote_tp
