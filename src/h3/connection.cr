@@ -84,16 +84,19 @@ module H3
     end
 
     # Opens the QPACK encoder stream (type=2) and decoder stream (type=3).
-    # Sends Set Dynamic Table Capacity(4096) to inform the peer's decoder of our
-    # maximum table size (RFC 9204 §3.2.2), without enabling the dynamic table
-    # in our own encoder (which stays at capacity=0, emitting literals only).
-    # This avoids QPACK blocked-stream races where the peer's client-side decoder
-    # tries to process a HEADERS frame before receiving our Insert instructions.
+    # Enables the dynamic table (capacity=4096) on our encoder and informs the
+    # peer's decoder via a Set Dynamic Table Capacity instruction (RFC 9204 §3.2.2).
+    #
+    # To revert to static-only QPACK (no dynamic table, ~10-42% higher latency):
+    #   1. In connection_actor.cr init_h3_control_streams, change SETTINGS 0x01 back to 0_u64.
+    #   2. Replace the set_capacity call below with:
+    #      QPACK::Integer.encode(@qpack_encoder.encoder_stream_io, 4096_u64, 5, 0x20_u8)
+    #      (tells the peer its decoder may use up to 4096 bytes, but our encoder stays at cap=0)
     def open_qpack_streams
       return if @encoder_stream_local
       @encoder_stream_local = open_uni_stream(0x02_u64)
       @decoder_stream_local = open_uni_stream(0x03_u64)
-      QPACK::Integer.encode(@qpack_encoder.encoder_stream_io, 4096_u64, 5, 0x20_u8)
+      @qpack_encoder.set_capacity(4096_u64)
       flush_encoder_stream
     end
 

@@ -188,9 +188,9 @@ module H3
     private def init_h3_control_streams
       ctrl = @h3_conn.open_control_stream
       sf   = H3::SettingsFrame.new
-      # 0x01 = QPACK_MAX_TABLE_CAPACITY = 0  (our decoder uses static-only; peer must not use dynamic table)
-      # 0x07 = QPACK_BLOCKED_STREAMS, 0x06 = MAX_FIELD_SECTION_SIZE, 0x33 = H3_DATAGRAM (RFC 9297)
-      sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 100_u64, 0x06_u64 => 16384_u64}
+      # 0x01 = QPACK_MAX_TABLE_CAPACITY = 4096 (peers may use the dynamic table with us)
+      # 0x07 = QPACK_BLOCKED_STREAMS, 0x06 = MAX_FIELD_SECTION_SIZE
+      sf.settings = {0x01_u64 => 4096_u64, 0x07_u64 => 100_u64, 0x06_u64 => 16384_u64}
       @h3_conn.write_frame(ctrl, sf)
       @h3_conn.open_qpack_streams
       flush_outgoing
