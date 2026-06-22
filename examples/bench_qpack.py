@@ -51,7 +51,9 @@ class Cli(QuicConnectionProtocol):
                 if ev.stream_ended:
                     self.ev.setdefault(sid, asyncio.Event())
                     self.ev[sid].set()
-        super().quic_event_received(e)
+        from aioquic.quic.events import StreamDataReceived as _SDR
+        if not isinstance(e, _SDR):
+            super().quic_event_received(e)
 
     async def do(self, method: str, path: str, body: bytes | None = None) -> tuple[float, int]:
         sid = self._quic.get_next_available_stream_id()

@@ -27,3 +27,14 @@ benchmark/crystal_server
 benchmark/go_server
 benchmark/results/
 benchmark/*_bench.log
+benchmark/crystal_http_server
+benchmark/__pycache__/
+
+# bench/ compiled binaries (source stays, binaries go)
+bench/go_server/go_h3_server
+
+# Root-level built binary
+/quic
+
+# Python cache
+examples/__pycache__/

@@ -85,7 +85,9 @@ class H3ClientProtocol(QuicConnectionProtocol):
             self.h3_events.append(h3_event)
             if getattr(h3_event, "stream_ended", False):
                 self.h3_stream_ended.add(h3_event.stream_id)
-        super().quic_event_received(event)
+        from aioquic.quic.events import StreamDataReceived as _SDR
+        if not isinstance(event, _SDR):
+            super().quic_event_received(event)
 
 
 def make_quic_config() -> QuicConfiguration:

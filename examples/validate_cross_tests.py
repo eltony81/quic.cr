@@ -30,7 +30,9 @@ class H3ClientProtocol(QuicConnectionProtocol):
             self.h3_events.append(h3_event)
             if hasattr(h3_event, "stream_ended") and h3_event.stream_ended:
                 self.h3_stream_ended.add(h3_event.stream_id)
-        super().quic_event_received(event)
+        from aioquic.quic.events import StreamDataReceived as _SDR
+        if not isinstance(event, _SDR):
+            super().quic_event_received(event)
 
 # ── H3 error codes (RFC 9114 §8.1) ───────────────────────────────────────────
 H3_FRAME_UNEXPECTED = 0x0105
