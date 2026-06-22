@@ -52,24 +52,31 @@ module H3
             @dynamic_table.set_capacity(capacity)
             
           elsif (b & 0x80) == 0x80
-            # 1 T XXXXXX (Insert With Name Reference)
+            # 1 T XXXXXX (Insert With Name Reference, RFC 9204 §3.2.5)
+            # Dynamic name ref uses a relative index with base = current insert_count
+            # (i.e. relative to the table state BEFORE this insert, not absolute).
             is_static = (b & 0x40) != 0
             idx = Integer.decode(io, b, 6).to_i
-            entry = is_static ? STATIC_TABLE[idx]? : @dynamic_table.get_by_absolute(idx.to_u64)
+            entry = if is_static
+              STATIC_TABLE[idx]?
+            else
+              @dynamic_table.get_by_relative(@dynamic_table.insert_count, idx.to_u64)
+            end
             name = entry ? entry[0] : ""
             value = H3::QPACK.decode_string(io, 7)
             @dynamic_table.add(name, value)
-            
+
           elsif (b & 0xC0) == 0x40
             # 01 H XXXXX (Insert Without Name Reference)
             name = H3::QPACK.decode_string(io, 5, b)
             value = H3::QPACK.decode_string(io, 7)
             @dynamic_table.add(name, value)
-            
+
           elsif (b & 0xE0) == 0x00
-            # 000 XXXXX (Duplicate)
+            # 000 XXXXX (Duplicate, RFC 9204 §3.2.7)
+            # Relative index with base = current insert_count.
             idx = Integer.decode(io, b, 5).to_i
-            if entry = @dynamic_table.get_by_absolute(idx.to_u64)
+            if entry = @dynamic_table.get_by_relative(@dynamic_table.insert_count, idx.to_u64)
               @dynamic_table.add(entry[0], entry[1])
             end
           else
@@ -109,7 +116,12 @@ module H3
             Integer.encode(@encoder_stream_io, s_idx.to_u64, 6, 0xC0_u8)
             encode_string(@encoder_stream_io, v, 7)
           elsif d_idx = dyn_name_idx
-            Integer.encode(@encoder_stream_io, d_idx.to_u64, 6, 0x80_u8)
+            # Convert deque position to relative index: relative 0 = most recent entry.
+            # abs_idx = dropped_count + d_idx (deque[0] = oldest = lowest abs idx).
+            # rel_idx = insert_count - 1 - abs_idx (RFC 9204 §3.2.6).
+            abs_idx  = @dynamic_table.dropped_count + d_idx.to_u64
+            rel_idx  = @dynamic_table.insert_count - 1_u64 - abs_idx
+            Integer.encode(@encoder_stream_io, rel_idx, 6, 0x80_u8)
             encode_string(@encoder_stream_io, v, 7)
           else
             encode_string(@encoder_stream_io, k, 5, 0x40_u8)
@@ -321,8 +333,9 @@ module H3
               field_value = entry[1]
             end
 
-          elsif (b & 0xF8) == 0x00
+          elsif (b & 0xF0) == 0x00
             # 0000 N XXX (Literal Field Line With Post-Base Name Reference)
+            # Mask 0xF0 (not 0xF8) so the N=1 "Never Indexed" bit (bit 3) is ignored.
             idx = Integer.decode(io, b, 3).to_i
             entry = @dynamic_table.get_by_post_base(base, idx.to_u64)
             field_name  = entry ? entry[0] : ""
