@@ -55,6 +55,14 @@ module H3
       end
     end
 
+    def shutdown
+      @quic_conn.close(0_u64, "server shutdown")
+      select
+      when @packet_chan.send(Bytes.empty)
+      else
+      end
+    end
+
     private def run
       loop do
         select

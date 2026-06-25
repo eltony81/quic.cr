@@ -28,6 +28,13 @@ module H3
 
     @low_level_handler : LowLevelHandler?
     @router : H3::Router?
+    @shutdown_flag = Atomic(Bool).new(false)
+    @udp_socket : UDPSocket? = nil
+
+    def shutdown
+      @shutdown_flag.set(true)
+      @udp_socket.try &.close rescue nil
+    end
 
     def initialize(&handler : Hash(String, String), Bytes -> {Hash(String, String), Bytes})
       @low_level_handler = handler
@@ -56,6 +63,7 @@ module H3
 
       udp = UDPSocket.new
       udp.bind(host, port)
+      @udp_socket = udp
       batch_receiver = QUIC::BatchReceiver.new(udp)
       batch_receiver.enable_gro!(udp)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
@@ -95,7 +103,9 @@ module H3
       # Router loop — single fiber, sole owner of `connections`.
       # Struct-tagged messages dispatch cleanly without select type merging.
       loop do
+        break if @shutdown_flag.get
         msg = router_chan.receive
+        break if @shutdown_flag.get
         case msg
         when RouterPacket
           data     = msg.data
@@ -134,8 +144,11 @@ module H3
           connections.delete(msg.addr_key)
         end
       end
+      connections.each_value do |actor|
+        actor.shutdown rescue nil
+      end
     rescue e : Exception
-      Log.error { "Server fatal error: #{e.message}\n#{e.backtrace.join("\n")}" }
+      Log.error { "Server fatal error: #{e.message}\n#{e.backtrace.join("\n")}" } unless @shutdown_flag.get
     end
 
     # ── Request dispatch ───────────────────────────────────────────────────────

@@ -146,6 +146,16 @@ module QUIC
     @send_ad_io      = IO::Memory.new(256)
     @dcid_locked = false
 
+    # RFC 9000 §5.1 — Connection ID tracking
+    @peer_cids = [] of {Bytes, UInt64, Bytes}  # {cid, sequence_number, stateless_reset_token}
+    @issued_cids = [] of {Bytes, UInt64}        # {cid, sequence_number}
+    @dcid_sequence_number : UInt64 = 0_u64
+    @pending_retire_cids = [] of UInt64
+
+    def peer_cid_count : Int32
+      @peer_cids.size
+    end
+
     def initialize(@config : Config, @is_server : Bool)
       @crypto_bufs[@space_initial] = {} of UInt64 => Bytes
       @crypto_bufs[@space_handshake] = {} of UInt64 => Bytes
@@ -581,6 +591,17 @@ module QUIC
         if frame.bidirectional
           maybe_extend_max_streams_bidi
         end
+      when NewConnectionIdFrame
+        # RFC 9000 §5.1.1: peer offers additional CIDs for our use.
+        @peer_cids << {frame.connection_id, frame.sequence_number, frame.stateless_reset_token}
+        @peer_cids.reject! { |(_, seq, _)| seq < frame.retire_prior_to }
+        if frame.retire_prior_to > 0 && @dcid_sequence_number < frame.retire_prior_to
+          @pending_retire_cids << @dcid_sequence_number
+          @dcid_sequence_number = frame.retire_prior_to
+        end
+      when RetireConnectionIdFrame
+        # RFC 9000 §5.1.2: peer is retiring one of our issued CIDs.
+        @issued_cids.reject! { |(_, seq)| seq == frame.sequence_number }
       when ConnectionCloseFrame
         Log.trace { "RECV ConnectionCloseFrame: error_code=0x#{frame.error_code.to_s(16)} reason=#{frame.reason}" }
         @closed = true
