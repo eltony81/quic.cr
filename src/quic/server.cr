@@ -53,9 +53,9 @@ module QUIC
             io.read_fully(dcid)
           end
 
-          # 1. Version Negotiation (RFC 9000 Section 6)
-          if is_long && version != 0x00000001_u32 && version != 0x00000000_u32
-            negotiation = VersionNegotiationPacket.new(scid, dcid, [0x00000001_u32])
+          # 1. Version Negotiation (RFC 9000 §6): advertise v1 and v2.
+          if is_long && version != Crypto::QUIC_V1_VERSION && version != Crypto::QUIC_V2_VERSION && version != 0x00000000_u32
+            negotiation = VersionNegotiationPacket.new(scid, dcid, [Crypto::QUIC_V1_VERSION, Crypto::QUIC_V2_VERSION])
             out_buf = IO::Memory.new
             negotiation.encode(out_buf)
             @socket.send(out_buf.to_slice, client_addr)
