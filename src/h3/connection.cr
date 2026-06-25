@@ -20,6 +20,7 @@ module H3
     @next_client_uni : UInt64 = 2
     @next_server_bidi : UInt64 = 1
     @next_server_uni : UInt64 = 3
+    @next_push_id : UInt64 = 0
 
     # Guards concurrent writes to the decoder stream (Section Ack + ICI).
     @decoder_stream_mutex = Mutex.new
@@ -115,14 +116,59 @@ module H3
     def write_frame(stream : IO, frame : Frame)
       if frame.is_a?(HeadersFrame)
         payload = @qpack_encoder.encode(frame.headers)
-        # Flush any new encoder stream instructions to the peer's decoder
         flush_encoder_stream
         QUIC::VarInt.write(stream, H3::FrameType::HEADERS.to_u64)
         QUIC::VarInt.write(stream, payload.size.to_u64)
         stream.write(payload)
+      elsif frame.is_a?(PushPromiseFrame) && (pid = frame.push_id) && (hdrs = frame.headers)
+        # Encode PUSH_PROMISE using the connection-scoped QPACK encoder so the
+        # dynamic table is shared with the push stream's HEADERS frame.
+        header_block = @qpack_encoder.encode(hdrs)
+        flush_encoder_stream
+        payload_io = IO::Memory.new
+        QUIC::VarInt.write(payload_io, pid)
+        payload_io.write(header_block)
+        QUIC::VarInt.write(stream, H3::FrameType::PUSH_PROMISE.to_u64)
+        QUIC::VarInt.write(stream, payload_io.size.to_u64)
+        stream.write(payload_io.to_slice)
       else
         frame.encode(stream)
       end
+    end
+
+    # Initiates an HTTP/3 server push (RFC 9114 §4.6).
+    # Sends PUSH_PROMISE on the client's request stream, then opens a server
+    # push stream (type=0x01) carrying the push_id and the response.
+    #
+    # push_request_headers: pseudo-headers describing the pushed resource
+    #   (e.g. {":method" => "GET", ":path" => "/style.css", ":scheme" => "https"})
+    # push_response_headers: response headers for the pushed resource
+    #   (e.g. {":status" => "200", "content-type" => "text/css"})
+    # push_body: the response body bytes (may be empty)
+    #
+    # Returns the push_id used (monotonically increasing from 0).
+    def server_push(
+      request_stream_id     : UInt64,
+      push_request_headers  : Hash(String, String),
+      push_response_headers : Hash(String, String),
+      push_body             : Bytes
+    ) : UInt64
+      push_id = @next_push_id
+      @next_push_id += 1
+
+      # 1. PUSH_PROMISE on the client's bidi request stream
+      req_sock = QUIC::StreamSocket.new(@quic, request_stream_id)
+      write_frame(req_sock, PushPromiseFrame.new(push_id, push_request_headers))
+
+      # 2. Server push stream: type byte 0x01 is written by open_uni_stream.
+      #    Then push_id as VarInt, then the full response.
+      push_sock = open_uni_stream(0x01_u64)
+      QUIC::VarInt.write(push_sock, push_id)
+      write_frame(push_sock, HeadersFrame.new(push_response_headers))
+      write_frame(push_sock, DataFrame.new(push_body)) unless push_body.empty?
+      push_sock.close_local
+
+      push_id
     end
 
     # Reads and decodes the next H3 frame from the stream.

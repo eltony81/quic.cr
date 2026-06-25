@@ -58,11 +58,32 @@ module H3
     end
   end
 
-  # Received when the client sends a PUSH_PROMISE frame; clients MUST NOT send
-  # PUSH_PROMISE (RFC 9114 §7.2.5), so this always triggers H3_ID_ERROR.
+  # PUSH_PROMISE frame (RFC 9114 §7.2.5).
+  # Server-to-client: carries push_id + QPACK-encoded request pseudo-headers for the
+  # pushed resource. Encoding is done by H3::Connection#write_frame (needs QPACK state).
+  # Client-to-server: MUST NOT be sent — triggers H3_ID_ERROR on receive.
   class PushPromiseFrame < Frame
+    getter push_id : UInt64?
+    getter headers : Hash(String, String)?
+
+    def initialize(@push_id : UInt64? = nil, @headers : Hash(String, String)? = nil)
+    end
+
     def type : FrameType; FrameType::PUSH_PROMISE; end
-    def encode(io : IO); end
+
+    # Standalone encode (uses a fresh static-only QPACK encoder).
+    # H3::Connection#write_frame overrides this to use the shared dynamic encoder.
+    def encode(io : IO)
+      pid = @push_id
+      hdrs = @headers
+      return unless pid && hdrs
+      payload_io = IO::Memory.new
+      QUIC::VarInt.write(payload_io, pid)
+      payload_io.write(QPACK::Encoder.new.encode(hdrs))
+      QUIC::VarInt.write(io, type.to_u64)
+      QUIC::VarInt.write(io, payload_io.size.to_u64)
+      io.write(payload_io.to_slice)
+    end
   end
 
   # PRIORITY_UPDATE frame (RFC 9218). Extended frame types 0xF0700 (request)
