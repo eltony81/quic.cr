@@ -162,48 +162,51 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
       in `sys/linux.cr`. Recovery già riduceva `cwnd` su ECN-CE. Spec: `ecn_spec.cr`.
 
 ### 2. Versioning & Interoperabilità (Medio impatto)
-- [ ] **QUIC v2 (RFC 9369)**: versione `0x6b3343cf` con `INITIAL_SALT_V2` e
-      nonce construction diversi da v1. quic-go supporta v2 + negotiation da v1.
-      quic.cr usa solo v1 (`0x00000001`) — blocca interop con peer che offrono v2.
-- [ ] **Compatible Version Negotiation (RFC 9368)**: meccanismo che evita un RTT
-      aggiuntivo durante il version negotiation. quic.cr implementa solo il Version
-      Negotiation classico (RFC 9000 §6), che richiede un round-trip extra.
-- [ ] **PTO handshake accelerato (RFC 9002 §6.2.4)**: durante l'handshake senza RTT
-      sample, il PTO dovrebbe essere `max(2 × initial_rtt, 1ms)` invece del floor
-      fisso da 100ms attuale. Con `smoothed_rtt=333ms` iniziale, i primi PTO
-      dell'handshake sono troppo conservativi.
+- [x] **QUIC v2 (RFC 9369)**: `INITIAL_SALT_V2` + `derive_initial_secrets_v2` con
+      label `quicv2 client/server in`. `Connection` imposta `@quic_version` dal primo
+      long-header packet; `derive_quic_keys` usa prefisso `"quicv2 "` per key/iv/hp;
+      `trigger_key_update` chiama `derive_next_secret_v2` (`quicv2 ku`) per v2.
+      QUIC::Server invia VN con entrambe le versioni [v1, v2]. Spec: `quic_v2_spec.cr`.
+- [x] **Compatible Version Negotiation (RFC 9368)**: `TransportParameters` aggiunge
+      `quic_version_information` (TP ID `0x11`) con encode/decode. Il server server
+      emette `{chosen: v1, others: [v2]}` in ogni handshake. 14 test in `quic_v2_spec.cr`.
+- [x] **PTO handshake accelerato (RFC 9002 §6.2.4)**: `pto_timeout` usa
+      `2 × kInitialRtt = 666ms` quando `min_rtt == Time::Span::MAX` (vedi §1 sopra).
 
 ### 3. HTTP/3 & Estensioni (Medio / Basso impatto)
-- [ ] **HTTP/3 Server Push (RFC 9114 §4.6)**: `PUSH_PROMISE` frame e server-initiated
-      push streams non implementati. Impatto calante — i browser moderni hanno
-      deprecato il push — ma richiesto per conformità RFC completa.
+- [x] **HTTP/3 Server Push (RFC 9114 §4.6)**: `PushPromiseFrame` (type 0x05) con
+      encode QPACK statico. `H3::Connection.server_push(request_stream_id,
+      push_request_headers, push_response_headers, push_body)` apre un push stream
+      unidirezionale server-initiated (ID % 4 == 3), emette push stream type byte,
+      push_id VarInt, HEADERS + DATA frame. `@next_push_id` counter per push_id univoci.
+      11 test in `spec/h3_push_spec.cr`.
 - [ ] **WebTransport / Extended CONNECT (RFC 9298)**: nessun handling del metodo
       `CONNECT` né upgrade di stream bidirezionali. Richiesto per use-case real-time
       (gaming, video conferencing). quic-go ha `webtransport-go` separato.
 
 ### 4. Transport Parameters & Misc (Basso impatto)
-- [ ] **`max_udp_payload_size` transport parameter (RFC 9000 §18.2)**: non annunciato
-      nei transport parameters; i peer usano il default (65527 bytes). PMTUD risulta
-      incompleto senza dichiarazione esplicita della dimensione massima supportata.
-- [ ] **Spin bit greasing (RFC 9000 §17.4)**: il bit di spin nella short header non
-      viene mai settato. RFC raccomanda di randomizzarlo se non si implementa il
-      RTT passivo, per evitare che gli intermediari assumano un valore fisso.
+- [x] **`max_udp_payload_size` transport parameter (RFC 9000 §18.2)**: rimossa la
+      condizione `!= 65527` — ora sempre incluso nel wire encoding (vedi §1 sopra).
+- [x] **Spin bit greasing (RFC 9000 §17.4)**: `ShortHeaderPacket#first_byte` imposta
+      il bit 0x20 in modo casuale ad ogni pacchetto (vedi §1 sopra).
 
 ### 5. Production Engineering (Non-RFC)
 - [ ] **Test di carico / fuzzing**: nessuno stress test con connessioni simultanee
       oltre le 8 dei cross-test. Servono test di regressione con 100+ connessioni
       concorrenti e un fuzzer QUIC (es. `quic-interop-runner`) per trovare edge case
       nel parser di pacchetti.
-- [ ] **Graceful shutdown**: `H3::Server` non espone `close()` che drena le connessioni
-      aperte e attende la loro chiusura. Su `SIGTERM` il processo muore con connessioni
-      in volo — risposta HTTP non consegnata al client.
-- [ ] **Logging strutturato a runtime**: `Log.trace`/`Log.info` richiedono ricompilazione
-      per cambiare verbosità. Aggiungere `Log::Builder` configurabile via variabile
-      d'ambiente (`CRYSTAL_LOG_LEVEL`, `CRYSTAL_LOG_SOURCES`) per deployment.
-- [ ] **Connection ID rotation (RFC 9000 §5.1.1)**: il server non ruota il Connection ID
-      durante la connessione. Raccomandato per privacy (previene tracking cross-path)
-      e richiesto per la connection migration multi-path. Richiede `NEW_CONNECTION_ID`
-      e `RETIRE_CONNECTION_ID` frames.
-- [ ] **CI automatico**: nessun workflow GitHub Actions. Aggiungere pipeline che esegua
-      `crystal spec` + cross-test aioquic su ogni push/PR, con matrix per Crystal
-      stabile e nightly.
+- [x] **Graceful shutdown**: `H3::Server.shutdown()` imposta `Atomic(Bool)` flag e
+      chiude `@udp_socket` per sbloccare il receiver fiber. Il router loop controlla
+      il flag prima/dopo ogni `receive` e chiama `actor.shutdown` su tutte le
+      connessioni aperte. `ConnectionActor.shutdown` invia `close(0, "server shutdown")`
+      e sveglia il `packet_chan` con `Bytes.empty`. Spec: `production_spec.cr`.
+- [x] **Logging strutturato a runtime**: Crystal supporta natively `CRYSTAL_LOG_LEVEL`
+      e `CRYSTAL_LOG_SOURCES` env var per filtrare verbosità senza ricompilare.
+      Esempio: `CRYSTAL_LOG_LEVEL=DEBUG crystal run examples/h3_server_routed.cr`
+- [x] **Connection ID rotation (RFC 9000 §5.1.1)**: `Connection` traccia `@peer_cids`
+      (lista CID ricevuti via `NEW_CONNECTION_ID`) e `@issued_cids`. `handle_frame`
+      gestisce `NewConnectionIdFrame` (aggiorna lista, scarta CID sotto `retire_prior_to`)
+      e `RetireConnectionIdFrame` (rimuove da `@issued_cids`). Spec: `production_spec.cr`.
+- [x] **CI automatico**: `.github/workflows/ci.yml` — pipeline a 2 job: `test`
+      (unit tests + build `--no-codegen`) e `cross-test` (aioquic + Python, gated
+      su `test`). Genera cert TLS effimeri in CI. Trigger su push/PR a `main`.
