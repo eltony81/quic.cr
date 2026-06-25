@@ -7,6 +7,9 @@ lib LibSys
 
   # IPPROTO_UDP = SOL_UDP = 17 (used as cmsg_level for UDP_SEGMENT)
   IPPROTO_UDP = 17
+  # IP socket options (POSIX / linux/in.h)
+  IPPROTO_IP = 0   # level: generic IP options
+  IP_TOS     = 1   # Type of Service byte — lower 2 bits are ECN codepoints
 
   struct Iovec
     iov_base : Void*

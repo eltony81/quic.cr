@@ -56,12 +56,22 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement PTO (Probe Timeout) timers.
   - [x] Logic to clone and retransmit lost stream/crypto frames.
   - [x] Full ACK range processing (all ranges, not just first) per RFC 9002 Section 2.3.
-  - [ ] **Loss Detection Timer (RFC 9002 §6.2)**: attualmente `detect_lost_packets` è
-        chiamato ogni 10ms dal `tick()` (fix anti-false-positive). Sostituire con un
-        timer dedicato: `@loss_time = oldest_unacked.time_sent + loss_delay`. Il timer
-        si aggiorna in `on_ack_received` e si valuta in `tick()`; si cancella se lo
-        spazio è vuoto. Questo eliminerebbe il delay fisso di 10ms per ciclo che
-        oggi penalizza il 1MB di ~55ms rispetto a quic-go.
+  - [x] **Loss Detection Timer (RFC 9002 §6.2)**: implementato `@loss_time` in
+        `Recovery` — calcolato in `on_ack_received` come `oldest_unacked.time_sent +
+        loss_delay` (via `compute_loss_delay`). Valutato in `tick()`: se `now >=
+        loss_time` si chiama `detect_lost_packets` e si azzera il timer. Rimosso il
+        flag `pending_loss_detection?` precedente. Il tick immediato post-drain
+        nell'actor è stato escluso (re-introduce falsi positivi su loopback con RTT
+        ~2ms ≈ loss_delay); il tick da 10ms resta necessario come buffer anti-burst.
+  - [x] **Pacing + Timer Dinamico (RFC 9002 §7.7)**: implementati in `connection_actor.cr`:
+        1. **Token bucket pacing**: `flush_outgoing` accredita token a `pacing_rate_bps`
+           byte/s (da `Recovery`), cap a 10ms di burst. Ogni send scala i token; se
+           esauriti il loop si interrompe e il prossimo tick rifornisce. Inizia con
+           token=∞ per non bloccare handshake e slow-start.
+        2. **Timer dinamico**: `next_tick_timeout` sostituisce `timeout(10ms)` — restituisce
+           `min(loss_time - now, pto - now, 50ms)` con floor di 3ms (buffer per batch ACK
+           asyncio da 1ms). Su loopback: Crystal 260ms ≈ Go 263ms sul 1MB (+1.01×),
+           miglioramento da 1.21× precedente.
 - [x] **Flow Control Enforcement**:
   - [x] Track local and remote `MAX_DATA` correctly across the connection.
   - [x] Track `MAX_STREAM_DATA` for individual streams.
@@ -113,10 +123,87 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement middleware support and routing mechanics.
 
 ### 4. Concurrency & Memory Optimization
-- [ ] **Fiber-based Concurrency**: 
+- [x] **Fiber-based Concurrency**: 
   - [x] Refactor UDP listener into a dedicated network thread/loop.
   - [x] Dispatch connection handling via channels and `spawn` blocks.
 - [x] **Zero-Copy Memory Allocation**:
   - [x] Implement `QUIC::BufferPool` — thread-safe pool of reusable `Bytes` slices (lease/return/borrow).
   - [x] `H3::Server.listen` receiver fiber leases a buffer per packet and returns it immediately after copy.
   - [x] Optimize AEAD functions to process buffers in-place: cached `@nonce` (zero alloc per call) + `update_into`/`gcm_get_tag_into` write directly into a single pre-allocated result buffer (1 alloc instead of 4+ intermediates).
+
+## Phase 7: RFC Compliance & Interoperability Gaps
+
+### 1. Sicurezza & Robustezza (Alto impatto)
+- [x] **Key Update (RFC 9001 §6)**: `ShortHeaderPacket` emette il bit `KEY_PHASE`
+      (0x04, coperto da header protection) in base a `@key_phase`. Al receive, dopo
+      l'unprotection, se `peer_kp != @peer_key_phase` si chiama `handle_peer_key_update`
+      che deriva le chiavi next-gen via `derive_next_secret`, tenta il decrypt, e su
+      successo commita le nuove chiavi e aggiorna `@key_phase`. Le vecchie RX keys
+      sono salvate in `@old_aead_rx` per i pacchetti out-of-order. `trigger_key_update`
+      (auto-iniziazione) salva old RX e flippa `@key_phase`. Spec: `key_update_spec.cr`.
+- [x] **Spin bit greasing (RFC 9000 §17.4)**: `ShortHeaderPacket#first_byte` imposta
+      il bit 0x20 in modo casuale ad ogni pacchetto. Il bit non è coperto da header
+      protection (RFC 9001 §5.4.1) — visibile in chiaro agli intermediari ma
+      randomizzato per prevenire ossificazione da middlebox.
+- [x] **`max_udp_payload_size` transport parameter (RFC 9000 §18.2)**: rimossa la
+      condizione `!= 65527` che impediva l'emissione del parametro quando il valore
+      coincideva con il default RFC. Ora sempre incluso nel wire encoding.
+- [x] **PTO handshake accelerato (RFC 9002 §6.2.4)**: `pto_timeout` ora usa
+      `2 × kInitialRtt = 666ms` quando `min_rtt == Time::Span::MAX` (nessun campione
+      RTT ancora disponibile). In precedenza calcolava `smoothed_rtt(333ms) + rttvar×4
+      + 25ms = 1022ms`, il 34% più lento del valore RFC raccomandato.
+- [x] **Stateless Reset emissione (RFC 9000 §10.3)**: `H3::Server` router loop ora
+      detecta short-header packets (bit7=0) con DCID sconosciuto e risponde con un
+      pacchetto da 40 byte contenente il token HMAC-SHA256 deterministico (già usato
+      da `QUIC::Server`). Spec: `stateless_reset_spec.cr`.
+- [x] **ECN codepoints in uscita (RFC 9000 §13.4 + RFC 9002 §7.6)**: `H3::Server`
+      e `QUIC::Server` chiamano `setsockopt(IP_TOS=1, ECT(0)=2, IPPROTO_IP=0)` sul
+      `UDPSocket` dopo il bind. Costanti `IPPROTO_IP`/`IP_TOS` aggiunte a `LibSys`
+      in `sys/linux.cr`. Recovery già riduceva `cwnd` su ECN-CE. Spec: `ecn_spec.cr`.
+
+### 2. Versioning & Interoperabilità (Medio impatto)
+- [ ] **QUIC v2 (RFC 9369)**: versione `0x6b3343cf` con `INITIAL_SALT_V2` e
+      nonce construction diversi da v1. quic-go supporta v2 + negotiation da v1.
+      quic.cr usa solo v1 (`0x00000001`) — blocca interop con peer che offrono v2.
+- [ ] **Compatible Version Negotiation (RFC 9368)**: meccanismo che evita un RTT
+      aggiuntivo durante il version negotiation. quic.cr implementa solo il Version
+      Negotiation classico (RFC 9000 §6), che richiede un round-trip extra.
+- [ ] **PTO handshake accelerato (RFC 9002 §6.2.4)**: durante l'handshake senza RTT
+      sample, il PTO dovrebbe essere `max(2 × initial_rtt, 1ms)` invece del floor
+      fisso da 100ms attuale. Con `smoothed_rtt=333ms` iniziale, i primi PTO
+      dell'handshake sono troppo conservativi.
+
+### 3. HTTP/3 & Estensioni (Medio / Basso impatto)
+- [ ] **HTTP/3 Server Push (RFC 9114 §4.6)**: `PUSH_PROMISE` frame e server-initiated
+      push streams non implementati. Impatto calante — i browser moderni hanno
+      deprecato il push — ma richiesto per conformità RFC completa.
+- [ ] **WebTransport / Extended CONNECT (RFC 9298)**: nessun handling del metodo
+      `CONNECT` né upgrade di stream bidirezionali. Richiesto per use-case real-time
+      (gaming, video conferencing). quic-go ha `webtransport-go` separato.
+
+### 4. Transport Parameters & Misc (Basso impatto)
+- [ ] **`max_udp_payload_size` transport parameter (RFC 9000 §18.2)**: non annunciato
+      nei transport parameters; i peer usano il default (65527 bytes). PMTUD risulta
+      incompleto senza dichiarazione esplicita della dimensione massima supportata.
+- [ ] **Spin bit greasing (RFC 9000 §17.4)**: il bit di spin nella short header non
+      viene mai settato. RFC raccomanda di randomizzarlo se non si implementa il
+      RTT passivo, per evitare che gli intermediari assumano un valore fisso.
+
+### 5. Production Engineering (Non-RFC)
+- [ ] **Test di carico / fuzzing**: nessuno stress test con connessioni simultanee
+      oltre le 8 dei cross-test. Servono test di regressione con 100+ connessioni
+      concorrenti e un fuzzer QUIC (es. `quic-interop-runner`) per trovare edge case
+      nel parser di pacchetti.
+- [ ] **Graceful shutdown**: `H3::Server` non espone `close()` che drena le connessioni
+      aperte e attende la loro chiusura. Su `SIGTERM` il processo muore con connessioni
+      in volo — risposta HTTP non consegnata al client.
+- [ ] **Logging strutturato a runtime**: `Log.trace`/`Log.info` richiedono ricompilazione
+      per cambiare verbosità. Aggiungere `Log::Builder` configurabile via variabile
+      d'ambiente (`CRYSTAL_LOG_LEVEL`, `CRYSTAL_LOG_SOURCES`) per deployment.
+- [ ] **Connection ID rotation (RFC 9000 §5.1.1)**: il server non ruota il Connection ID
+      durante la connessione. Raccomandato per privacy (previene tracking cross-path)
+      e richiesto per la connection migration multi-path. Richiede `NEW_CONNECTION_ID`
+      e `RETIRE_CONNECTION_ID` frames.
+- [ ] **CI automatico**: nessun workflow GitHub Actions. Aggiungere pipeline che esegua
+      `crystal spec` + cross-test aioquic su ogni push/PR, con matrix per Crystal
+      stabile e nightly.

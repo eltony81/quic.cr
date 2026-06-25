@@ -10,6 +10,9 @@ module QUIC
     def initialize(@config, address : String, port : Int32)
       @socket = UDPSocket.new
       @socket.bind(address, port)
+      # ECN: ECT(0) on outgoing datagrams (RFC 9000 §13.4)
+      tos = 2
+      LibC.setsockopt(@socket.fd, LibSys::IPPROTO_IP, LibSys::IP_TOS, pointerof(tos).as(Void*), sizeof(Int32).to_u32)
     end
 
     def listen

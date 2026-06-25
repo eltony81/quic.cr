@@ -34,6 +34,10 @@ module H3
     @out_buf          : Bytes
     @fwd_buf          : Bytes
     @batch_sender     : QUIC::BatchSender
+    # Pacing token bucket: tokens represent bytes we are allowed to send right now.
+    # Starts unlimited so the handshake and initial burst are never throttled.
+    @pacing_tokens    : Float64 = Float64::MAX
+    @pacing_refill_at : Time::Instant = Time.instant
 
     def initialize(
       @quic_conn, @h3_conn, @peer_addr, @udp, @server,
@@ -81,7 +85,7 @@ module H3
         when resp = @response_chan.receive
           handle_response(resp[0], resp[1])
 
-        when timeout(10.milliseconds)
+        when timeout(next_tick_timeout)
           @quic_conn.tick
           flush_outgoing
         end
@@ -178,11 +182,36 @@ module H3
       end
     end
 
+    # Computes when the actor's timer should next fire.
+    # Uses loss_time / PTO from the connection when available, with a 3ms minimum
+    # floor to allow asyncio ACK batches to arrive before loss detection runs.
+    # Falls back to 50ms when idle (no in-flight packets).
+    private def next_tick_timeout : Time::Span
+      if t = @quic_conn.next_event_time
+        delta = t - Time.local
+        return 3.milliseconds if delta <= 3.milliseconds
+        [delta, 50.milliseconds].min
+      else
+        50.milliseconds
+      end
+    end
+
     private def flush_outgoing
+      now = Time.instant
+      rate = @quic_conn.pacing_rate_bps
+      elapsed = (now - @pacing_refill_at).total_seconds
+      @pacing_refill_at = now
+
+      # Refill token bucket; cap at 10ms worth of data to bound burst size.
+      max_burst = rate * 0.010
+      @pacing_tokens = (@pacing_tokens + rate * elapsed).clamp(0.0, max_burst)
+
       loop do
+        break if @pacing_tokens <= 0
         n = @quic_conn.send_coalesced(@out_buf)
         break if n == 0
         @udp.send(@out_buf[0, n], @peer_addr)
+        @pacing_tokens -= n
       end
     rescue
 

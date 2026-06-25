@@ -24,7 +24,7 @@ module QUIC
       write_param(io, 0x00_u64, @original_destination_connection_id)
       write_param(io, 0x01_u64, @max_idle_timeout) if @max_idle_timeout > 0
       write_param(io, 0x02_u64, @stateless_reset_token)
-      write_param(io, 0x03_u64, @max_udp_payload_size) if @max_udp_payload_size != 65527
+      write_param(io, 0x03_u64, @max_udp_payload_size) # RFC 9000 §18.2: always advertise
       write_param(io, 0x04_u64, @initial_max_data) if @initial_max_data > 0
       write_param(io, 0x05_u64, @initial_max_stream_data_bidi_local) if @initial_max_stream_data_bidi_local > 0
       write_param(io, 0x06_u64, @initial_max_stream_data_bidi_remote) if @initial_max_stream_data_bidi_remote > 0

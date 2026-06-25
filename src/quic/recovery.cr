@@ -2,10 +2,12 @@ module QUIC
   class Recovery
     # Per-space largest-acked (0=Initial, 1=Handshake, 2=App)
     @largest_acked = {0 => 0_u64, 1 => 0_u64, 2 => 0_u64}
-    @pending_loss_detection : Bool = false
+    # RFC 9002 §6.1.2 loss detection alarm: earliest time at which an
+    # unacknowledged packet (sent before largest_acked) is declared lost.
+    @loss_time : Time? = nil
 
-    def pending_loss_detection?; @pending_loss_detection; end
-    def clear_pending_loss_detection; @pending_loss_detection = false; end
+    def loss_time; @loss_time; end
+    def clear_loss_time; @loss_time = nil; end
     def largest_acked; @largest_acked; end
     # Key: {space_id, packet_number} — avoids collisions between Initial/Handshake/App
     # spaces that each independently start their packet numbers at 0.
@@ -93,7 +95,7 @@ module QUIC
 
       @largest_acked[space_id] = Math.max(@largest_acked[space_id]? || 0_u64, ack.largest_acknowledged)
       @pto_count = 0 # Reset PTO on successful ACK
-      @pending_loss_detection = true
+      update_loss_time(space_id)
 
       # ECN-CE congestion signal (RFC 9002 §7.6): new CE marks → congestion event.
       if ack.has_ecn? && ack.ecn_ce > @last_ecn_ce
@@ -160,14 +162,34 @@ module QUIC
       end
     end
 
+    private def update_loss_time(space_id : Int32)
+      largest = @largest_acked[space_id]? || 0_u64
+      return if largest == 0
+      loss_delay = compute_loss_delay
+      earliest : Time? = nil
+      @sent_packets.each do |(sp, pn), packet|
+        next if sp != space_id
+        next if pn > largest
+        t = packet.time_sent + loss_delay
+        earliest = t if earliest.nil? || t < earliest.not_nil!
+      end
+      if e = earliest
+        @loss_time = e if @loss_time.nil? || e < @loss_time.not_nil!
+      end
+    end
+
+    private def compute_loss_delay : Time::Span
+      delay = Math.max(@latest_rtt, @smoothed_rtt)
+      delay += (delay / 8)
+      Math.max(delay, 1.millisecond)
+    end
+
     def detect_lost_packets(largest_acked : UInt64, now : Time = Time.local, space_id : Int32 = 2) : Array(SentPacket)
       lost_packets = [] of SentPacket
 
       # Time-threshold only (RFC 9002 §6.1.2); packet-threshold omitted per §6.1.1 MAY
       # to avoid false positives when partial ACKs arrive before the full burst is ACKed.
-      loss_delay = Math.max(@latest_rtt, @smoothed_rtt)
-      loss_delay += (loss_delay / 8)
-      loss_delay = Math.max(loss_delay, 1.millisecond)
+      loss_delay = compute_loss_delay
 
       lost_keys = [] of {Int32, UInt64}
       @sent_packets.each do |(sp, pn), packet|
@@ -223,11 +245,16 @@ module QUIC
     end
 
     def pto_timeout : Time::Span
-      base = @smoothed_rtt + (@rttvar * 4) + 25.milliseconds
-      # 100ms floor prevents premature PTO during TLS handshake (~50ms crypto).
-      # Exponential backoff per RFC 9002 §6.2.1 (2^pto_count, capped at 8×).
+      backoff = Math.min(1 << @pto_count, 8)
+      # RFC 9002 §6.2.4: before the first RTT sample, use 2 × kInitialRtt (333ms).
+      # This is faster than the formula with smoothed_rtt=333ms + rttvar=166ms = 1022ms.
+      if @min_rtt == Time::Span::MAX
+        return 666.milliseconds * backoff
+      end
+      base = @smoothed_rtt + Math.max(@rttvar * 4, 1.millisecond) + 25.milliseconds
+      # 100ms floor prevents premature PTO after handshake on low-latency links.
       effective = base > 100.milliseconds ? base : 100.milliseconds
-      effective * Math.min(1 << @pto_count, 8)
+      effective * backoff
     end
 
     def timeout : Time?

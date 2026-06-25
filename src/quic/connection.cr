@@ -89,6 +89,26 @@ module QUIC
       @tls.handshake_complete?
     end
 
+    # Current pacing rate in bytes/second from the active path's congestion controller.
+    def pacing_rate_bps : Float64
+      @recovery.pacing_rate_bps
+    end
+
+    # Earliest time at which a loss detection alarm or PTO should fire across all paths.
+    # Returns nil when there are no in-flight packets.
+    def next_event_time : Time?
+      candidates = [] of Time
+      @paths.each do |path|
+        if lt = path.recovery.loss_time
+          candidates << lt
+        end
+        if pto = path.recovery.timeout
+          candidates << pto
+        end
+      end
+      candidates.min?
+    end
+
     # Returns serialized TLS session bytes for 0-RTT resumption on the next connection.
     # Available after the server has sent a NewSessionTicket (typically after the first
     # response is received). Returns nil if the session is not yet available.
@@ -146,6 +166,13 @@ module QUIC
     @send_ad_io      = IO::Memory.new(256)
     @dcid_locked = false
 
+    # Key Update (RFC 9001 §6): KEY_PHASE bit in short-header packets.
+    # Toggled on each key update; 0 is the initial value for 1-RTT keys.
+    getter key_phase : UInt8 = 0
+    @peer_key_phase : UInt8 = 0
+    # Previous RX AEAD retained for out-of-order packets from before the update.
+    @old_aead_rx : Crypto::AEAD? = nil
+
     def initialize(@config : Config, @is_server : Bool)
       @crypto_bufs[@space_initial] = {} of UInt64 => Bytes
       @crypto_bufs[@space_handshake] = {} of UInt64 => Bytes
@@ -199,12 +226,16 @@ module QUIC
         end
       end
 
-      # Timer-based loss detection per RFC 9002 §6.1: run once per tick so that
-      # all ACKs from the current asyncio batch are processed before declaring loss.
-      if @recovery.pending_loss_detection? && @tls.handshake_complete?
-        @recovery.clear_pending_loss_detection
-        la = @recovery.largest_acked[2]? || 0_u64
-        queue_lost_frames(@recovery.detect_lost_packets(la, space_id: 2)) if la > 0
+      # RFC 9002 §6.2 loss detection alarm: fires when oldest unACKed packet's
+      # send time + loss_delay has elapsed, rather than on a fixed 10ms poll.
+      if @tls.handshake_complete?
+        if lt = @recovery.loss_time
+          if now >= lt
+            @recovery.clear_loss_time
+            la = @recovery.largest_acked[2]? || 0_u64
+            queue_lost_frames(@recovery.detect_lost_packets(la, space_id: 2)) if la > 0
+          end
+        end
       end
     end
 
@@ -428,6 +459,9 @@ module QUIC
         @space_app.hp_rx.not_nil!.apply!(final_data, pn_offset, mask, unprotect: true)
 
         pn_len = (final_data[0] & 0x03) + 1
+        # RFC 9001 §6: KEY_PHASE bit (0x04) is within the HP mask and reveals
+        # the true key generation only after header unprotection.
+        peer_kp = (final_data[0] & 0x04_u8) != 0 ? 1_u8 : 0_u8
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len .. -1]
 
@@ -443,7 +477,20 @@ module QUIC
              else 0_u64
              end
 
-        plaintext = @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
+        plaintext = if peer_kp != @peer_key_phase
+          handle_peer_key_update(peer_kp, ad, pn, ciphertext)
+        else
+          begin
+            @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
+          rescue ex
+            # Try old keys: out-of-order packet from before the last key update.
+            if old = @old_aead_rx
+              old.decrypt(ad, pn, ciphertext)
+            else
+              raise ex
+            end
+          end
+        end
 
         @space_app.received_pns << pn
 
@@ -767,7 +814,9 @@ module QUIC
 
       packet = if space == @space_app
                  return 0 if @dcid.nil?
-                 ShortHeaderPacket.new(@dcid.not_nil!)
+                 pkt = ShortHeaderPacket.new(@dcid.not_nil!)
+                 pkt.key_phase = @key_phase
+                 pkt
                elsif space == @space_zero_rtt
                  return 0 if @scid.nil? || @dcid.nil?
                  LongHeaderPacket.new(PacketType::ZeroRTT, 0x00000001_u32, @dcid.not_nil!, @scid.not_nil!)
@@ -1114,6 +1163,8 @@ module QUIC
       server_secret = @server_app_secret
       return if client_secret.nil? || server_secret.nil?
 
+      @old_aead_rx = @space_app.aead_rx  # retain for out-of-order reordering window
+
       _, _, key_len, _, use_sha384 = cipher_suite_info
       if use_sha384
         next_client = Crypto.derive_next_secret_sha384(client_secret)
@@ -1140,6 +1191,57 @@ module QUIC
       else
         @space_app.aead_rx = make_aead(server_key, server_iv)
         @space_app.aead_tx = make_aead(client_key, client_iv)
+      end
+
+      @key_phase ^= 1_u8
+      Log.debug { "Key update (self-initiated): key_phase=#{@key_phase}" }
+    end
+
+    # RFC 9001 §6: peer flipped KEY_PHASE — derive next-generation 1-RTT keys,
+    # attempt decryption.  On success commit the new secrets and respond with the
+    # matching KEY_PHASE on our outgoing packets.  On failure (packet reordering
+    # arriving after a legitimate key update), fall back to the current keys.
+    private def handle_peer_key_update(peer_kp : UInt8, ad : Bytes, pn : UInt64, ciphertext : Bytes) : Bytes
+      cs = @client_app_secret
+      ss = @server_app_secret
+      return @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext) if cs.nil? || ss.nil?
+
+      _, _, key_len, _, use_sha384 = cipher_suite_info
+      if use_sha384
+        nc = Crypto.derive_next_secret_sha384(cs)
+        ns = Crypto.derive_next_secret_sha384(ss)
+        ck = Crypto.hkdf_expand_label_sha384(nc, "quic key", Bytes.empty, key_len)
+        ci = Crypto.hkdf_expand_label_sha384(nc, "quic iv",  Bytes.empty, 12)
+        sk = Crypto.hkdf_expand_label_sha384(ns, "quic key", Bytes.empty, key_len)
+        si = Crypto.hkdf_expand_label_sha384(ns, "quic iv",  Bytes.empty, 12)
+      else
+        nc = Crypto.derive_next_secret(cs)
+        ns = Crypto.derive_next_secret(ss)
+        ck = Crypto.hkdf_expand_label(nc, "quic key", Bytes.empty, key_len)
+        ci = Crypto.hkdf_expand_label(nc, "quic iv",  Bytes.empty, 12)
+        sk = Crypto.hkdf_expand_label(ns, "quic key", Bytes.empty, key_len)
+        si = Crypto.hkdf_expand_label(ns, "quic iv",  Bytes.empty, 12)
+      end
+      next_rx = @is_server ? make_aead(ck, ci) : make_aead(sk, si)
+      next_tx = @is_server ? make_aead(sk, si) : make_aead(ck, ci)
+
+      begin
+        pt = next_rx.decrypt(ad, pn, ciphertext)
+        # Decryption succeeded — commit the new key generation.
+        @old_aead_rx       = @space_app.aead_rx
+        @space_app.aead_rx = next_rx
+        @space_app.aead_tx = next_tx
+        @client_app_secret = nc
+        @server_app_secret = ns
+        @peer_key_phase    = peer_kp
+        @key_phase         = peer_kp  # mirror peer KEY_PHASE for outgoing packets
+        Log.debug { "Key update (peer-initiated): key_phase=#{peer_kp}" }
+        pt
+      rescue
+        # Likely a reordered packet from before the last key update — retry with
+        # current keys (which may also fail and propagate the error upward).
+        Log.trace { "Key update probe failed, retrying with current keys" }
+        @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
       end
     end
 

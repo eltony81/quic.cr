@@ -56,6 +56,11 @@ module H3
 
       udp = UDPSocket.new
       udp.bind(host, port)
+      # ECN: mark outgoing UDP datagrams as ECT(0) so network routers can signal
+      # congestion via CE marks in ACK frames instead of dropping packets
+      # (RFC 9000 §13.4, RFC 9002 §7.6).
+      tos = 2  # ECT(0) = 0x02
+      LibC.setsockopt(udp.fd, LibSys::IPPROTO_IP, LibSys::IP_TOS, pointerof(tos).as(Void*), sizeof(Int32).to_u32)
       batch_receiver = QUIC::BatchReceiver.new(udp)
       batch_receiver.enable_gro!(udp)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
@@ -112,6 +117,20 @@ module H3
           # entire connection life, so it acts as a safe fallback.
           actor = connections[conn_key]? || connections[addr_key]?
           if actor.nil?
+            # Short-header from unknown DCID → stateless reset (RFC 9000 §10.3).
+            # The peer has lost our state; we respond with a deterministic HMAC
+            # token derived from the DCID so the peer recognises the reset without
+            # requiring us to store any per-connection state.
+            if !data.empty? && (data[0] & 0x80_u8) == 0
+              dcid_bytes = data.size >= 9 ? data[1, 8] : Bytes.empty
+              token = QUIC::AddressValidation.stateless_reset_token(dcid_bytes)
+              reset_pkt = Bytes.new(40)
+              reset_pkt[0] = 0x40_u8 | Random::Secure.rand(64).to_u8
+              Random::Secure.random_bytes(reset_pkt[1, 23])
+              reset_pkt[24, 16].copy_from(token)
+              udp.send(reset_pkt, addr) rescue nil
+              next
+            end
             quic_conn = QUIC::Connection.new(config, is_server: true)
             h3_conn   = H3::Connection.new(quic_conn)
             actor = ConnectionActor.new(

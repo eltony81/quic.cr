@@ -139,15 +139,24 @@ module QUIC
     def type : PacketType
       PacketType::Short
     end
-    
+
     getter dcid : Bytes
+    # RFC 9001 §6: KEY_PHASE bit (0x04) indicates which 1-RTT key generation is
+    # in use.  Covered by header protection (within the 0x1f short-header mask,
+    # RFC 9001 §5.4.1) so the peer only sees the true value after unprotecting.
+    property key_phase : UInt8 = 0
 
     def initialize(@dcid, @frames = [] of Frame)
     end
 
     def first_byte : UInt8
       pn_len_encoded = 0x03_u8
-      0x40_u8 | pn_len_encoded
+      # RFC 9000 §17.4: spin bit (0x20) SHOULD be randomised (greased) when not
+      # actively used for RTT measurement, to prevent ossification by middleboxes.
+      # The spin bit is not covered by header protection (RFC 9001 §5.4.1).
+      spin = Random.rand(2) == 1 ? 0x20_u8 : 0x00_u8
+      kp   = @key_phase != 0 ? 0x04_u8 : 0x00_u8
+      0x40_u8 | spin | kp | pn_len_encoded
     end
 
     def encode_header(io : IO)
