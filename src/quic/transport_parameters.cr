@@ -19,6 +19,9 @@ module QUIC
     property initial_source_connection_id : Bytes?
     property retry_source_connection_id : Bytes?
     property max_datagram_frame_size : UInt64 = 0
+    # RFC 9368: Compatible Version Negotiation.
+    # {chosen_version, [other_supported_versions]}
+    property quic_version_information : {UInt32, Array(UInt32)}? = nil
 
     def encode(io : IO)
       write_param(io, 0x00_u64, @original_destination_connection_id)
@@ -39,7 +42,14 @@ module QUIC
       write_param(io, 0x0f_u64, @initial_source_connection_id)
       write_param(io, 0x10_u64, @retry_source_connection_id)
       write_param(io, 0x20_u64, @max_datagram_frame_size) if @max_datagram_frame_size > 0
-      
+      if vi = @quic_version_information
+        chosen, others = vi
+        io.write VarInt.encode(0x11_u64)
+        val_size = 4 + 4 * others.size
+        io.write VarInt.encode(val_size.to_u64)
+        IO::ByteFormat::NetworkEndian.encode(chosen, io)
+        others.each { |v| IO::ByteFormat::NetworkEndian.encode(v, io) }
+      end
     end
 
     private def write_param(io : IO, id : UInt64, value : UInt64)
@@ -107,6 +117,17 @@ module QUIC
             params.retry_source_connection_id = read_bytes(io, length)
           when 0x20_u64
             params.max_datagram_frame_size = read_varint_value(io, length)
+          when 0x11_u64
+            # RFC 9368: Version Information TP
+            chosen = IO::ByteFormat::NetworkEndian.decode(UInt32, io)
+            others = [] of UInt32
+            bytes_read = 4_u64
+            while bytes_read + 4 <= length
+              others << IO::ByteFormat::NetworkEndian.decode(UInt32, io)
+              bytes_read += 4
+            end
+            io.skip(length - bytes_read) if bytes_read < length
+            params.quic_version_information = {chosen, others}
           else
             # Ignore unknown parameters
             io.skip(length)

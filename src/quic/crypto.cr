@@ -54,6 +54,14 @@ module QUIC
   module Crypto
     INITIAL_SALT_V1 = Bytes[0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a]
 
+    QUIC_V1_VERSION = 0x00000001_u32
+    QUIC_V2_VERSION = 0x6b3343cf_u32
+
+    # RFC 9369 §3.1: QUIC v2 uses a distinct initial salt.
+    INITIAL_SALT_V2 = Bytes[0x0d, 0xed, 0xe3, 0xef, 0x0a, 0x87, 0x96, 0x57,
+                             0x73, 0x5e, 0x79, 0xf4, 0x92, 0x55, 0x3f, 0x11,
+                             0xed, 0xb8, 0x61, 0x73]
+
     class AEAD
       @key : Bytes
       @iv : Bytes
@@ -180,8 +188,26 @@ module QUIC
       {client_initial_secret, server_initial_secret}
     end
 
+    # RFC 9369 §3.2: QUIC v2 derives initial secrets with the v2 salt and
+    # "quicv2 client in" / "quicv2 server in" labels.
+    def self.derive_initial_secrets_v2(dcid : Bytes)
+      initial_secret = hkdf_extract(INITIAL_SALT_V2, dcid)
+      client = hkdf_expand_label(initial_secret, "quicv2 client in", Bytes.empty, 32)
+      server = hkdf_expand_label(initial_secret, "quicv2 server in", Bytes.empty, 32)
+      {client, server}
+    end
+
     def self.derive_next_secret(secret : Bytes) : Bytes
       hkdf_expand_label(secret, "ku", Bytes.empty, 32)
+    end
+
+    # RFC 9369 §3.3: QUIC v2 key update uses "quicv2 ku" label.
+    def self.derive_next_secret_v2(secret : Bytes) : Bytes
+      hkdf_expand_label(secret, "quicv2 ku", Bytes.empty, 32)
+    end
+
+    def self.derive_next_secret_v2_sha384(secret : Bytes) : Bytes
+      hkdf_expand_label_sha384(secret, "quicv2 ku", Bytes.empty, 48)
     end
 
     # SHA-384 variants for TLS_AES_256_GCM_SHA384 (RFC 9001 §5.3).

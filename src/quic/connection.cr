@@ -172,6 +172,9 @@ module QUIC
     @peer_key_phase : UInt8 = 0
     # Previous RX AEAD retained for out-of-order packets from before the update.
     @old_aead_rx : Crypto::AEAD? = nil
+    # QUIC version negotiated for this connection.  Defaults to v1; updated to
+    # v2 when a v2 long-header packet arrives (RFC 9369).
+    getter quic_version : UInt32 = Crypto::QUIC_V1_VERSION
 
     def initialize(@config : Config, @is_server : Bool)
       @crypto_bufs[@space_initial] = {} of UInt64 => Bytes
@@ -304,6 +307,10 @@ module QUIC
       if is_long
         version = IO::ByteFormat::NetworkEndian.decode(UInt32, io)
         Log.trace { "RECV DEBUG: long header version=#{version.to_s(16)} first_byte=#{first_byte.to_s(16)}" }
+        # Track the QUIC version from the first valid long-header packet.
+        if version == Crypto::QUIC_V2_VERSION || version == Crypto::QUIC_V1_VERSION
+          @quic_version = version
+        end
         dcid_len = io.read_byte || return 0
         dcid = Bytes.new(dcid_len)
         io.read_fully(dcid)
@@ -341,6 +348,7 @@ module QUIC
           tp.initial_max_streams_uni = @config.initial_max_streams_uni
           tp.original_destination_connection_id = dcid
           tp.initial_source_connection_id = @scid.not_nil!
+          tp.quic_version_information = {Crypto::QUIC_V1_VERSION, [Crypto::QUIC_V2_VERSION]}
           @tls.update_local_tp(tp)
         end
 
@@ -1166,20 +1174,22 @@ module QUIC
       @old_aead_rx = @space_app.aead_rx  # retain for out-of-order reordering window
 
       _, _, key_len, _, use_sha384 = cipher_suite_info
+      is_v2 = @quic_version == Crypto::QUIC_V2_VERSION
+      prefix = is_v2 ? "quicv2 " : "quic "
       if use_sha384
-        next_client = Crypto.derive_next_secret_sha384(client_secret)
-        next_server = Crypto.derive_next_secret_sha384(server_secret)
-        client_key = Crypto.hkdf_expand_label_sha384(next_client, "quic key", Bytes.empty, key_len)
-        client_iv  = Crypto.hkdf_expand_label_sha384(next_client, "quic iv",  Bytes.empty, 12)
-        server_key = Crypto.hkdf_expand_label_sha384(next_server, "quic key", Bytes.empty, key_len)
-        server_iv  = Crypto.hkdf_expand_label_sha384(next_server, "quic iv",  Bytes.empty, 12)
+        next_client = is_v2 ? Crypto.derive_next_secret_v2_sha384(client_secret) : Crypto.derive_next_secret_sha384(client_secret)
+        next_server = is_v2 ? Crypto.derive_next_secret_v2_sha384(server_secret) : Crypto.derive_next_secret_sha384(server_secret)
+        client_key = Crypto.hkdf_expand_label_sha384(next_client, "#{prefix}key", Bytes.empty, key_len)
+        client_iv  = Crypto.hkdf_expand_label_sha384(next_client, "#{prefix}iv",  Bytes.empty, 12)
+        server_key = Crypto.hkdf_expand_label_sha384(next_server, "#{prefix}key", Bytes.empty, key_len)
+        server_iv  = Crypto.hkdf_expand_label_sha384(next_server, "#{prefix}iv",  Bytes.empty, 12)
       else
-        next_client = Crypto.derive_next_secret(client_secret)
-        next_server = Crypto.derive_next_secret(server_secret)
-        client_key = Crypto.hkdf_expand_label(next_client, "quic key", Bytes.empty, key_len)
-        client_iv  = Crypto.hkdf_expand_label(next_client, "quic iv",  Bytes.empty, 12)
-        server_key = Crypto.hkdf_expand_label(next_server, "quic key", Bytes.empty, key_len)
-        server_iv  = Crypto.hkdf_expand_label(next_server, "quic iv",  Bytes.empty, 12)
+        next_client = is_v2 ? Crypto.derive_next_secret_v2(client_secret) : Crypto.derive_next_secret(client_secret)
+        next_server = is_v2 ? Crypto.derive_next_secret_v2(server_secret) : Crypto.derive_next_secret(server_secret)
+        client_key = Crypto.hkdf_expand_label(next_client, "#{prefix}key", Bytes.empty, key_len)
+        client_iv  = Crypto.hkdf_expand_label(next_client, "#{prefix}iv",  Bytes.empty, 12)
+        server_key = Crypto.hkdf_expand_label(next_server, "#{prefix}key", Bytes.empty, key_len)
+        server_iv  = Crypto.hkdf_expand_label(next_server, "#{prefix}iv",  Bytes.empty, 12)
       end
 
       @client_app_secret = next_client
@@ -1262,15 +1272,21 @@ module QUIC
     end
 
     private def setup_initial_secrets(dcid : Bytes)
-      client_secret, server_secret = Crypto.derive_initial_secrets(dcid)
-      
-      client_key = Crypto.hkdf_expand_label(client_secret, "quic key", Bytes.empty, 16)
-      client_iv  = Crypto.hkdf_expand_label(client_secret, "quic iv", Bytes.empty, 12)
-      client_hp  = Crypto.hkdf_expand_label(client_secret, "quic hp", Bytes.empty, 16)
-      
-      server_key = Crypto.hkdf_expand_label(server_secret, "quic key", Bytes.empty, 16)
-      server_iv  = Crypto.hkdf_expand_label(server_secret, "quic iv", Bytes.empty, 12)
-      server_hp  = Crypto.hkdf_expand_label(server_secret, "quic hp", Bytes.empty, 16)
+      if @quic_version == Crypto::QUIC_V2_VERSION
+        client_secret, server_secret = Crypto.derive_initial_secrets_v2(dcid)
+        prefix = "quicv2 "
+      else
+        client_secret, server_secret = Crypto.derive_initial_secrets(dcid)
+        prefix = "quic "
+      end
+
+      client_key = Crypto.hkdf_expand_label(client_secret, "#{prefix}key", Bytes.empty, 16)
+      client_iv  = Crypto.hkdf_expand_label(client_secret, "#{prefix}iv", Bytes.empty, 12)
+      client_hp  = Crypto.hkdf_expand_label(client_secret, "#{prefix}hp", Bytes.empty, 16)
+
+      server_key = Crypto.hkdf_expand_label(server_secret, "#{prefix}key", Bytes.empty, 16)
+      server_iv  = Crypto.hkdf_expand_label(server_secret, "#{prefix}iv", Bytes.empty, 12)
+      server_hp  = Crypto.hkdf_expand_label(server_secret, "#{prefix}hp", Bytes.empty, 16)
 
       if @is_server
         @space_initial.aead_rx = Crypto::AEAD.new(client_key, client_iv)
@@ -1300,14 +1316,16 @@ module QUIC
 
     private def derive_quic_keys(secret : Bytes) : {Bytes, Bytes, Bytes}
       aead_name, hp_name, key_len, hp_len, use_sha384 = cipher_suite_info
+      # RFC 9369 §3.3: QUIC v2 1-RTT keys use "quicv2 " label prefix.
+      prefix = @quic_version == Crypto::QUIC_V2_VERSION ? "quicv2 " : "quic "
       if use_sha384
-        key = Crypto.hkdf_expand_label_sha384(secret, "quic key", Bytes.empty, key_len)
-        iv  = Crypto.hkdf_expand_label_sha384(secret, "quic iv",  Bytes.empty, 12)
-        hp  = Crypto.hkdf_expand_label_sha384(secret, "quic hp",  Bytes.empty, hp_len)
+        key = Crypto.hkdf_expand_label_sha384(secret, "#{prefix}key", Bytes.empty, key_len)
+        iv  = Crypto.hkdf_expand_label_sha384(secret, "#{prefix}iv",  Bytes.empty, 12)
+        hp  = Crypto.hkdf_expand_label_sha384(secret, "#{prefix}hp",  Bytes.empty, hp_len)
       else
-        key = Crypto.hkdf_expand_label(secret, "quic key", Bytes.empty, key_len)
-        iv  = Crypto.hkdf_expand_label(secret, "quic iv",  Bytes.empty, 12)
-        hp  = Crypto.hkdf_expand_label(secret, "quic hp",  Bytes.empty, hp_len)
+        key = Crypto.hkdf_expand_label(secret, "#{prefix}key", Bytes.empty, key_len)
+        iv  = Crypto.hkdf_expand_label(secret, "#{prefix}iv",  Bytes.empty, 12)
+        hp  = Crypto.hkdf_expand_label(secret, "#{prefix}hp",  Bytes.empty, hp_len)
       end
       {key, iv, hp}
     end
