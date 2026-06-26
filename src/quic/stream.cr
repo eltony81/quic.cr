@@ -33,15 +33,10 @@ module QUIC
     def write(data : Bytes) : Int32
       return 0 if @state == StreamState::Closed || @state == StreamState::HalfClosedLocal
       @state = StreamState::Open if @state == StreamState::Idle
-      
-      allowed = @max_stream_data_remote - @tx_offset
-      to_write = Math.min(data.size.to_u64, allowed).to_i
-      
-      return 0 if to_write <= 0
-      
+      # Buffer all data unconditionally; flow-control gating is in poll_send_data.
       @send_buffer.seek(0, IO::Seek::End)
-      @send_buffer.write(data[0, to_write])
-      to_write
+      @send_buffer.write(data)
+      data.size
     end
 
     # RFC 9000 §3.4: remote aborted its send side — any pending read returns EOF.
@@ -167,9 +162,11 @@ module QUIC
       
       blocked_reason = nil
       if remaining > 0 && len < remaining
-        if stream_available == 0_u64
+        # Report which flow-control limit is the bottleneck.
+        # stream_available <= conn_available means the stream window is tighter.
+        if stream_available <= conn_available
           blocked_reason = :stream
-        elsif conn_available == 0_u64
+        else
           blocked_reason = :connection
         end
       end

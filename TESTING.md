@@ -132,7 +132,64 @@ curl -v --http3 "https://127.0.0.1:4433/echo" --insecure -X POST \
 
 ---
 
-## 5. Benchmark Crystal HTTP/3 vs Go (quic-go)
+## 5. E2E test suite Go/quic-go (330 test)
+
+Suite completa di test end-to-end che verifica l'interoperabilità tra quic.cr e quic-go.
+Copre verbi HTTP, status code, large data, concorrenza, key update, multi-connessione e QUIC v2.
+
+### 5a. Compila il server e2e
+
+```bash
+crystal build examples/e2e_server.cr -o /tmp/e2e_server
+```
+
+### 5b. Avvia il server
+
+```bash
+/tmp/e2e_server &
+```
+
+### 5c. Lancia la test suite
+
+```bash
+cd bench/go_client
+go run main.go
+```
+
+Output atteso:
+
+```
+  HTTP Verbs:                              9/9
+  Status Codes:                            5/5
+  Large Data:                              4/4
+  Response Headers:                        3/3
+  Concurrent GET ×50:                      50/50
+  Concurrent POST ×20:                     20/20
+  Concurrent Large ×10:                    10/10
+  Sequential Load 200 reqs (Key Update):   200/200
+  Key Update: ✓ triggered and handled correctly (pn > 100)
+  Multiple Connections (5 QUIC conns):     25/25
+  QUIC v2 (RFC 9369):                      4/4
+
+════════════════════════════════════════════════════
+  QUIC/HTTP3 E2E Suite   330/330  in 1.793s
+════════════════════════════════════════════════════
+ALL PASSED ✓
+```
+
+Singoli test subset (esegui file separati in `bench/go_client/`):
+
+| File | Cosa testa |
+|------|------------|
+| `main.go` | Suite completa 330 test |
+| (altri file .go nella directory) | Suite individuali |
+
+> Il server e2e ascolta su `127.0.0.1:4433` con i certificati `cert.pem`/`key.pem` del repo.
+> Killalo con `pkill -f /tmp/e2e_server` o `ps aux | grep e2e_server` + `kill <PID>`.
+
+---
+
+## 6. Benchmark Crystal HTTP/3 vs Go (quic-go)
 
 Confronto diretto tra quic.cr e quic-go su tre scenari: small GET, small POST, large POST (1 MB).
 Lo script misura ogni scenario con N round sequenziali, **una nuova connessione QUIC per richiesta**

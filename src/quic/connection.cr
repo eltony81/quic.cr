@@ -3,6 +3,7 @@ module QUIC
     property largest_acked : UInt64 = 0
     property packet_number : UInt64 = 0
     property received_pns = [] of UInt64
+    property largest_received_pn : UInt64 = 0
     property pending_ack : Bool = false
     property aead_rx : Crypto::AEAD?
     property aead_tx : Crypto::AEAD?
@@ -290,13 +291,13 @@ module QUIC
 
         data.size
       rescue e : QUIC::Error
-        Log.error { "QUIC Protocol Error: #{e.class} - #{e.message}" }
+        STDERR.puts "CLOSE[proto]: #{e.class} #{e.message} largest_rx=#{@space_app.largest_received_pn}"
         @closed = true
         @close_error = e.error_code
         @close_reason = e.message || "Protocol Error"
         0
       rescue e : Exception
-        Log.error { "QUIC Internal Error: #{e.class} - #{e.message}" }
+        STDERR.puts "CLOSE[internal]: #{e.class} #{e.message} largest_rx=#{@space_app.largest_received_pn}"
         @closed = true
         @close_error = QUIC::ErrorCode::INTERNAL_ERROR
         @close_reason = "Internal Error"
@@ -358,13 +359,22 @@ module QUIC
           tp.initial_max_streams_uni = @config.initial_max_streams_uni
           tp.original_destination_connection_id = dcid
           tp.initial_source_connection_id = @scid.not_nil!
-          tp.quic_version_information = {Crypto::QUIC_V1_VERSION, [Crypto::QUIC_V2_VERSION]}
+          # RFC 9369 §3.4: chosen_version must reflect the version actually in use.
+          other = @quic_version == Crypto::QUIC_V2_VERSION ? Crypto::QUIC_V1_VERSION : Crypto::QUIC_V2_VERSION
+          tp.quic_version_information = {@quic_version, [other]}
           @tls.update_local_tp(tp)
         end
 
         type_bits = (first_byte >> 4) & 0x03
 
-        if !@is_server && type_bits == 0x03
+        # RFC 9369 §3.2: QUIC v2 rotates the long-header packet type bits.
+        # v1: Initial=0x00, 0-RTT=0x01, Handshake=0x02, Retry=0x03
+        # v2: Initial=0x01, 0-RTT=0x02, Handshake=0x03, Retry=0x00
+        is_v2 = @quic_version == Crypto::QUIC_V2_VERSION
+        retry_type   = is_v2 ? 0x00_u8 : 0x03_u8
+        initial_type = is_v2 ? 0x01_u8 : 0x00_u8
+
+        if !@is_server && type_bits == retry_type
           # Retry packet
           token_len = io.size - io.pos - 16
           if token_len >= 0
@@ -397,15 +407,24 @@ module QUIC
           return data.size
         end
 
-        space = case type_bits
-                when 0x00 then @space_initial    # Initial
-                when 0x01 then @space_zero_rtt   # 0-RTT Protected (RFC 9000 §17.2.3)
-                when 0x02 then @space_handshake  # Handshake
-                else @space_initial
+        space = if is_v2
+                  case type_bits
+                  when 0x01 then @space_initial    # v2 Initial
+                  when 0x02 then @space_zero_rtt   # v2 0-RTT
+                  when 0x03 then @space_handshake  # v2 Handshake
+                  else @space_initial
+                  end
+                else
+                  case type_bits
+                  when 0x00 then @space_initial    # v1 Initial
+                  when 0x01 then @space_zero_rtt   # v1 0-RTT
+                  when 0x02 then @space_handshake  # v1 Handshake
+                  else @space_initial
+                  end
                 end
 
         token_len = 0_u64
-        if type_bits == 0x00 # Initial
+        if type_bits == initial_type  # Initial packets carry a token field
           token_len = VarInt.decode(io)
           io.skip(token_len)
         end
@@ -448,6 +467,7 @@ module QUIC
         plaintext = aead.decrypt(ad, pn, ciphertext)
 
         space.received_pns << pn
+        space.largest_received_pn = pn if pn > space.largest_received_pn
 
         has_ack_eliciting = false
         payload_io = IO::Memory.new(plaintext)
@@ -483,32 +503,59 @@ module QUIC
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len .. -1]
         pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
-        pn = case pn_len
-             when 1 then pn_io.read_byte.not_nil!.to_u64
-             when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
-             when 3
-               b = Bytes.new(3)
-               pn_io.read_fully(b)
-               (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
-             when 4 then IO::ByteFormat::NetworkEndian.decode(UInt32, pn_io).to_u64
-             else 0_u64
-             end
-        plaintext = if peer_kp != @peer_key_phase
-          handle_peer_key_update(peer_kp, ad, pn, ciphertext)
-        else
-          begin
-            @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
-          rescue ex
-            # Try old keys: out-of-order packet from before the last key update.
-            if old = @old_aead_rx
-              old.decrypt(ad, pn, ciphertext)
-            else
-              raise ex
+        trunc_pn = case pn_len
+                   when 1 then pn_io.read_byte.not_nil!.to_u64
+                   when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
+                   when 3
+                     b = Bytes.new(3)
+                     pn_io.read_fully(b)
+                     (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
+                   when 4 then IO::ByteFormat::NetworkEndian.decode(UInt32, pn_io).to_u64
+                   else 0_u64
+                   end
+        # RFC 9000 §A.3: reconstruct the full 62-bit PN from the truncated wire value.
+        # Fall back to the raw truncated PN if reconstruction overshot due to out-of-order
+        # delivery pushing largest_received_pn ahead of this packet's actual PN.
+        full_pn = decode_packet_number(@space_app.largest_received_pn, trunc_pn, pn_len * 8)
+        pn = full_pn
+        plaintext = begin
+          if peer_kp != @peer_key_phase
+            handle_peer_key_update(peer_kp, ad, full_pn, ciphertext)
+          else
+            begin
+              @space_app.aead_rx.not_nil!.decrypt(ad, full_pn, ciphertext)
+            rescue ex
+              if old = @old_aead_rx
+                old.decrypt(ad, full_pn, ciphertext)
+              else
+                raise ex
+              end
             end
+          end
+        rescue ex_outer
+          STDERR.puts "PN-FAIL: full_pn=#{full_pn} trunc_pn=#{trunc_pn} fallback=#{full_pn != trunc_pn} err=#{ex_outer.message}"
+          if full_pn != trunc_pn
+            pn = trunc_pn
+            if peer_kp != @peer_key_phase
+              handle_peer_key_update(peer_kp, ad, trunc_pn, ciphertext)
+            else
+              begin
+                @space_app.aead_rx.not_nil!.decrypt(ad, trunc_pn, ciphertext)
+              rescue ex
+                if old = @old_aead_rx
+                  old.decrypt(ad, trunc_pn, ciphertext)
+                else
+                  raise ex
+                end
+              end
+            end
+          else
+            raise ex_outer
           end
         end
 
         @space_app.received_pns << pn
+        @space_app.largest_received_pn = pn if pn > @space_app.largest_received_pn
 
         has_ack_eliciting = false
         payload_io = IO::Memory.new(plaintext)
@@ -523,6 +570,23 @@ module QUIC
 
         # Short-header packets extend to the end of the datagram.
         data.size
+      end
+    end
+
+    # RFC 9000 Appendix A.3: reconstruct the full 62-bit packet number from
+    # the truncated PN carried on the wire and the largest received PN so far.
+    private def decode_packet_number(largest_pn : UInt64, truncated_pn : UInt64, pn_nbits : Int32) : UInt64
+      expected_pn = largest_pn + 1_u64
+      pn_win      = 1_u64 << pn_nbits
+      pn_hwin     = pn_win >> 1
+      pn_mask     = pn_win - 1_u64
+      candidate   = (expected_pn & ~pn_mask) | truncated_pn
+      if candidate + pn_hwin <= expected_pn
+        candidate + pn_win
+      elsif candidate > expected_pn + pn_hwin && candidate >= pn_win
+        candidate - pn_win
+      else
+        candidate
       end
     end
 
@@ -763,8 +827,14 @@ module QUIC
         return 0
       end
       unless @recovery.can_send?
-        Log.trace { "SEND DEBUG: recovery blocked, bytes_in_flight=#{@recovery.bytes_in_flight} window=#{@recovery.congestion_window}" }
-        return 0
+        # ACK-only and control-frame sends bypass the congestion window —
+        # they are not counted as bytes-in-flight and must not be blocked.
+        has_pending_ack = @space_initial.pending_ack || @space_handshake.pending_ack || @space_app.pending_ack
+        has_control = !@lost_frames.empty? || !@pending_reset_streams.empty? || @pending_handshake_done
+        unless has_pending_ack || has_control
+          Log.trace { "SEND DEBUG: recovery blocked, bytes_in_flight=#{@recovery.bytes_in_flight} window=#{@recovery.congestion_window}" }
+          return 0
+        end
       end
 
       # Anti-Amplification Limit (RFC 9000 Section 9.3)
@@ -859,13 +929,13 @@ module QUIC
                  pkt
                elsif space == @space_zero_rtt
                  return 0 if @scid.nil? || @dcid.nil?
-                 LongHeaderPacket.new(PacketType::ZeroRTT, 0x00000001_u32, @dcid.not_nil!, @scid.not_nil!)
+                 LongHeaderPacket.new(PacketType::ZeroRTT, @quic_version, @dcid.not_nil!, @scid.not_nil!)
                else
                  return 0 if @scid.nil? || @dcid.nil?
                  packet_type = space == @space_initial ? PacketType::Initial : PacketType::Handshake
                  LongHeaderPacket.new(
                    packet_type,
-                   0x00000001_u32,
+                   @quic_version,
                    @dcid.not_nil!,
                    @scid.not_nil!,
                    token: @retry_token
@@ -943,18 +1013,33 @@ module QUIC
       if space.pending_ack && !space.received_pns.empty?
         space.received_pns.sort!
         largest = space.received_pns.last
-        # Count consecutive run from largest downward for first_ack_range
+        # Build multi-range ACK per RFC 9000 §19.3.1 to avoid retransmit storms.
+        # Walk received_pns from largest downward, collecting contiguous runs and gaps.
         first_ack_range = 0_u64
         i = space.received_pns.size - 2
         while i >= 0 && space.received_pns[i] == largest - first_ack_range - 1
           first_ack_range += 1
           i -= 1
         end
-        packet.frames << AckFrame.new(largest, 0_u64, first_ack_range)
+        # current_smallest = largest - first_ack_range (smallest PN in the top run)
+        current_smallest = largest - first_ack_range
+        additional_ranges = [] of {UInt64, UInt64}
+        while i >= 0
+          next_largest_in_range = space.received_pns[i]
+          # gap = unACKed packets between current_smallest and next_largest_in_range
+          # Formula: next_largest = current_smallest - gap - 2  →  gap = current_smallest - next_largest - 2
+          gap = current_smallest - next_largest_in_range - 2
+          range_len = 0_u64
+          while i >= 0 && space.received_pns[i] == next_largest_in_range - range_len
+            range_len += 1
+            i -= 1
+          end
+          additional_ranges << {gap, range_len - 1}
+          current_smallest = next_largest_in_range - (range_len - 1)
+        end
+        packet.frames << AckFrame.new(largest, 0_u64, first_ack_range, additional_ranges)
         space.pending_ack = false
-        # Remove only the contiguous top range we just acknowledged; keep any gaps
-        ack_min = largest - first_ack_range
-        space.received_pns.reject! { |pn| pn >= ack_min && pn <= largest }
+        space.received_pns.clear
       end
       
       # ENFORCE CONGESTION CONTROL
@@ -1008,16 +1093,24 @@ module QUIC
         
         # 3. New Stream data
         conn_available = @max_data_remote > @data_sent ? @max_data_remote - @data_sent : 0_u64
-        
+        # Budget for stream payload bytes in this packet.  Short-header overhead
+        # is ≈29B (type+dcid+pn+AEAD-tag) plus ~10B per StreamFrame header.
+        # With path_mtu=1200 we leave ~1150B for all stream frames combined so
+        # the UDP datagram never exceeds the path MTU.
+        stream_budget = (@path_mtu.to_i - 30).clamp(256, 1200)
+
         @streams.each_value do |stream|
-          offset, data, send_fin, blocked_reason = stream.poll_send_data(1200, conn_available)
-          
+          break if stream_budget <= 0
+          per_stream_max = Math.min(stream_budget, 1200)
+          offset, data, send_fin, blocked_reason = stream.poll_send_data(per_stream_max, conn_available)
+
           if data.size > 0 || send_fin
             packet.frames << StreamFrame.new(stream.id, offset, data, send_fin)
             @data_sent += data.size.to_u64
             conn_available -= data.size.to_u64
+            stream_budget -= (data.size + 10)  # StreamFrame header overhead ≈10B
           end
-          
+
           if blocked_reason == :connection
             packet.frames << DataBlockedFrame.new(@max_data_remote)
           elsif blocked_reason == :stream
@@ -1159,6 +1252,10 @@ module QUIC
           max_remote, _ = initial_stream_limits(stream_id)
           stream.update_max_stream_data(max_remote)
         end
+        # RFC 9002 §6.1.2: use peer's max_ack_delay as floor for loss detection.
+        if tp.max_ack_delay > 0
+          @paths.each { |p| p.recovery.peer_max_ack_delay = tp.max_ack_delay.milliseconds }
+        end
         @remote_tp_applied = true
       end
     end
@@ -1257,20 +1354,22 @@ module QUIC
       return @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext) if cs.nil? || ss.nil?
 
       _, _, key_len, _, use_sha384 = cipher_suite_info
+      is_v2 = @quic_version == Crypto::QUIC_V2_VERSION
+      prefix = is_v2 ? "quicv2 " : "quic "
       if use_sha384
-        nc = Crypto.derive_next_secret_sha384(cs)
-        ns = Crypto.derive_next_secret_sha384(ss)
-        ck = Crypto.hkdf_expand_label_sha384(nc, "quic key", Bytes.empty, key_len)
-        ci = Crypto.hkdf_expand_label_sha384(nc, "quic iv",  Bytes.empty, 12)
-        sk = Crypto.hkdf_expand_label_sha384(ns, "quic key", Bytes.empty, key_len)
-        si = Crypto.hkdf_expand_label_sha384(ns, "quic iv",  Bytes.empty, 12)
+        nc = is_v2 ? Crypto.derive_next_secret_v2_sha384(cs) : Crypto.derive_next_secret_sha384(cs)
+        ns = is_v2 ? Crypto.derive_next_secret_v2_sha384(ss) : Crypto.derive_next_secret_sha384(ss)
+        ck = Crypto.hkdf_expand_label_sha384(nc, "#{prefix}key", Bytes.empty, key_len)
+        ci = Crypto.hkdf_expand_label_sha384(nc, "#{prefix}iv",  Bytes.empty, 12)
+        sk = Crypto.hkdf_expand_label_sha384(ns, "#{prefix}key", Bytes.empty, key_len)
+        si = Crypto.hkdf_expand_label_sha384(ns, "#{prefix}iv",  Bytes.empty, 12)
       else
-        nc = Crypto.derive_next_secret(cs)
-        ns = Crypto.derive_next_secret(ss)
-        ck = Crypto.hkdf_expand_label(nc, "quic key", Bytes.empty, key_len)
-        ci = Crypto.hkdf_expand_label(nc, "quic iv",  Bytes.empty, 12)
-        sk = Crypto.hkdf_expand_label(ns, "quic key", Bytes.empty, key_len)
-        si = Crypto.hkdf_expand_label(ns, "quic iv",  Bytes.empty, 12)
+        nc = is_v2 ? Crypto.derive_next_secret_v2(cs) : Crypto.derive_next_secret(cs)
+        ns = is_v2 ? Crypto.derive_next_secret_v2(ss) : Crypto.derive_next_secret(ss)
+        ck = Crypto.hkdf_expand_label(nc, "#{prefix}key", Bytes.empty, key_len)
+        ci = Crypto.hkdf_expand_label(nc, "#{prefix}iv",  Bytes.empty, 12)
+        sk = Crypto.hkdf_expand_label(ns, "#{prefix}key", Bytes.empty, key_len)
+        si = Crypto.hkdf_expand_label(ns, "#{prefix}iv",  Bytes.empty, 12)
       end
       next_rx = @is_server ? make_aead(ck, ci) : make_aead(sk, si)
       next_tx = @is_server ? make_aead(sk, si) : make_aead(ck, ci)
@@ -1285,12 +1384,15 @@ module QUIC
         @server_app_secret = ns
         @peer_key_phase    = peer_kp
         @key_phase         = peer_kp  # mirror peer KEY_PHASE for outgoing packets
-        Log.debug { "Key update (peer-initiated): key_phase=#{peer_kp}" }
         pt
-      rescue
-        # Likely a reordered packet from before the last key update — retry with
-        # current keys (which may also fail and propagate the error upward).
-        Log.trace { "Key update probe failed, retrying with current keys" }
+      rescue ex_ku
+        # Likely a reordered packet — try old keys, then current keys.
+        if old = @old_aead_rx
+          begin
+            return old.decrypt(ad, pn, ciphertext)
+          rescue
+          end
+        end
         @space_app.aead_rx.not_nil!.decrypt(ad, pn, ciphertext)
       end
     end

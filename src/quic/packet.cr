@@ -28,11 +28,24 @@ module QUIC
     end
 
     def first_byte : UInt8
-      type_val = case @type
-                 when PacketType::Initial   then 0x00_u8
-                 when PacketType::ZeroRTT   then 0x01_u8
-                 when PacketType::Handshake then 0x02_u8
-                 else 0x00_u8
+      # RFC 9369 §3.2: QUIC v2 rotates long-header type bits.
+      # v1: Initial=0x00, 0-RTT=0x01, Handshake=0x02
+      # v2: Initial=0x01, 0-RTT=0x02, Handshake=0x03, Retry=0x00
+      is_v2 = @version == Crypto::QUIC_V2_VERSION
+      type_val = if is_v2
+                   case @type
+                   when PacketType::Initial   then 0x01_u8
+                   when PacketType::ZeroRTT   then 0x02_u8
+                   when PacketType::Handshake then 0x03_u8
+                   else 0x01_u8
+                   end
+                 else
+                   case @type
+                   when PacketType::Initial   then 0x00_u8
+                   when PacketType::ZeroRTT   then 0x01_u8
+                   when PacketType::Handshake then 0x02_u8
+                   else 0x00_u8
+                   end
                  end
       0xc0_u8 | (type_val << 4) | 0x03_u8
     end

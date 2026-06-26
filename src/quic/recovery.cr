@@ -18,6 +18,8 @@ module QUIC
     property smoothed_rtt : Time::Span = 333.milliseconds
     property rttvar : Time::Span = 166.milliseconds
     property min_rtt : Time::Span = Time::Span::MAX
+    # RFC 9002 §6.1.2: peer's max_ack_delay (ms) is the minimum loss delay floor.
+    property peer_max_ack_delay : Time::Span = 25.milliseconds
 
     # Congestion Control (RFC 9002 NewReno)
     MAX_DATAGRAM_SIZE = 1472_u64
@@ -181,9 +183,10 @@ module QUIC
     end
 
     private def compute_loss_delay : Time::Span
+      # RFC 9002 §6.1.2: loss delay = max(time_threshold × max(RTT, smoothed_RTT), peer_max_ack_delay)
       delay = Math.max(@latest_rtt, @smoothed_rtt)
       delay += (delay / 8)
-      Math.max(delay, 1.millisecond)
+      Math.max(delay, @peer_max_ack_delay)
     end
 
     def detect_lost_packets(largest_acked : UInt64, now : Time = Time.local, space_id : Int32 = 2) : Array(SentPacket)

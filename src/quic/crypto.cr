@@ -57,10 +57,10 @@ module QUIC
     QUIC_V1_VERSION = 0x00000001_u32
     QUIC_V2_VERSION = 0x6b3343cf_u32
 
-    # RFC 9369 §3.1: QUIC v2 uses a distinct initial salt.
-    INITIAL_SALT_V2 = Bytes[0x0d, 0xed, 0xe3, 0xef, 0x0a, 0x87, 0x96, 0x57,
-                             0x73, 0x5e, 0x79, 0xf4, 0x92, 0x55, 0x3f, 0x11,
-                             0xed, 0xb8, 0x61, 0x73]
+    # RFC 9369 §A.1: QUIC v2 uses a distinct initial salt.
+    INITIAL_SALT_V2 = Bytes[0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb,
+                             0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+                             0xf9, 0xbd, 0x2e, 0xd9]
 
     class AEAD
       @key : Bytes
@@ -188,12 +188,12 @@ module QUIC
       {client_initial_secret, server_initial_secret}
     end
 
-    # RFC 9369 §3.2: QUIC v2 derives initial secrets with the v2 salt and
-    # "quicv2 client in" / "quicv2 server in" labels.
+    # RFC 9369 §A.1: QUIC v2 initial secrets use v2 salt but same "client in" /
+    # "server in" labels as v1. The "quicv2 " prefix only applies to key/iv/hp.
     def self.derive_initial_secrets_v2(dcid : Bytes)
       initial_secret = hkdf_extract(INITIAL_SALT_V2, dcid)
-      client = hkdf_expand_label(initial_secret, "quicv2 client in", Bytes.empty, 32)
-      server = hkdf_expand_label(initial_secret, "quicv2 server in", Bytes.empty, 32)
+      client = hkdf_expand_label(initial_secret, "client in", Bytes.empty, 32)
+      server = hkdf_expand_label(initial_secret, "server in", Bytes.empty, 32)
       {client, server}
     end
 

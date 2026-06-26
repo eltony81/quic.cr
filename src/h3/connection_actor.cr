@@ -89,6 +89,9 @@ module H3
           # O(MB / 64KB) ≈ 16 sends for 1MB instead of ~680.
           forward_stream_data
           flush_outgoing
+          # Yield so handler fibers (waiting on data_chan) can run promptly.
+          # Without this, a busy actor processing rapid ACKs starves handlers.
+          Fiber.yield
 
         when resp = @response_chan.receive
           handle_response(resp[0], resp[1])
@@ -210,8 +213,9 @@ module H3
       elapsed = (now - @pacing_refill_at).total_seconds
       @pacing_refill_at = now
 
-      # Refill token bucket; cap at 10ms worth of data to bound burst size.
-      max_burst = rate * 0.010
+      # Refill token bucket; cap at 50ms worth of data.  Using 10ms caused
+      # ~38% throughput loss when ACKs arrive every 26ms (quic-go ACK delay).
+      max_burst = rate * 0.050
       @pacing_tokens = (@pacing_tokens + rate * elapsed).clamp(0.0, max_burst)
 
       loop do
@@ -228,9 +232,9 @@ module H3
     private def init_h3_control_streams
       ctrl = @h3_conn.open_control_stream
       sf   = H3::SettingsFrame.new
-      # 0x01 = QPACK_MAX_TABLE_CAPACITY = 4096 (peers may use the dynamic table with us)
-      # 0x07 = QPACK_BLOCKED_STREAMS, 0x06 = MAX_FIELD_SECTION_SIZE
-      sf.settings = {0x01_u64 => 4096_u64, 0x07_u64 => 100_u64, 0x06_u64 => 16384_u64}
+      # 0x01 = QPACK_MAX_TABLE_CAPACITY = 0 (disable dynamic QPACK; use static/literal only)
+      # 0x07 = QPACK_BLOCKED_STREAMS = 0, 0x06 = MAX_FIELD_SECTION_SIZE
+      sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 0_u64, 0x06_u64 => 16384_u64}
       @h3_conn.write_frame(ctrl, sf)
       @h3_conn.open_qpack_streams
       flush_outgoing
