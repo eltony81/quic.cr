@@ -147,9 +147,14 @@ module H3
   end
 
   abstract class Frame
+    # Maximum single-frame payload (16 MB). Guards against OOM when a malformed
+    # or malicious frame announces a huge length field (RFC 9114 §10.5).
+    MAX_FRAME_PAYLOAD = 16_777_216_u64
+
     def self.decode(io : IO, qpack_decoder : QPACK::Decoder? = nil) : Frame
       type_val = QUIC::VarInt.decode(io)
       length = QUIC::VarInt.decode(io)
+      raise IO::Error.new("H3 frame payload too large (#{length} bytes)") if length > MAX_FRAME_PAYLOAD
 
       case type_val
       when FrameType::DATA.to_u64

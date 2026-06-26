@@ -43,7 +43,7 @@ module QUIC
     @crypto_rx_offsets = {} of PacketNumberSpace => UInt64
     @crypto_tx_offsets = {} of PacketNumberSpace => UInt64
     
-    @lost_frames = [] of Frame
+    @lost_frames = [] of {Int32, Frame}  # {space_id, frame}
     
     getter paths : Array(Path) = [] of Path
     getter active_path_id : UInt64 = 0
@@ -256,7 +256,7 @@ module QUIC
       lost_pkts.each do |pkt|
         pkt.frames.each do |f|
           if f.is_a?(StreamFrame) || f.is_a?(CryptoFrame) || f.is_a?(MaxDataFrame) || f.is_a?(MaxStreamDataFrame) || f.is_a?(DatagramFrame)
-            @lost_frames << f
+            @lost_frames << {pkt.space_id, f}
           end
         end
       end
@@ -482,7 +482,6 @@ module QUIC
         peer_kp = (final_data[0] & 0x04_u8) != 0 ? 1_u8 : 0_u8
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len .. -1]
-
         pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
         pn = case pn_len
              when 1 then pn_io.read_byte.not_nil!.to_u64
@@ -494,7 +493,6 @@ module QUIC
              when 4 then IO::ByteFormat::NetworkEndian.decode(UInt32, pn_io).to_u64
              else 0_u64
              end
-
         plaintext = if peer_kp != @peer_key_phase
           handle_peer_key_update(peer_kp, ad, pn, ciphertext)
         else
@@ -535,6 +533,14 @@ module QUIC
         1
       else
         2
+      end
+    end
+
+    private def space_for_id(id : Int32) : PacketNumberSpace
+      case id
+      when 0 then @space_initial
+      when 1 then @space_handshake
+      else @space_app
       end
     end
 
@@ -830,6 +836,11 @@ module QUIC
                 elsif @space_zero_rtt.aead_tx && !@tls.handshake_complete?
                   # 0-RTT mode: send stream data before the handshake completes
                   @space_zero_rtt
+                elsif !@lost_frames.empty?
+                  # Retransmit in the original packet space so QUIC peers decrypt
+                  # with the correct keys.  Purge any frames whose keys are gone.
+                  @lost_frames.reject! { |sid, _| space_for_id(sid).aead_tx.nil? }
+                  @lost_frames.empty? ? (@space_app.aead_tx ? @space_app : @space_initial) : space_for_id(@lost_frames.first[0])
                 else
                   @space_app.aead_tx ? @space_app : @space_initial
                 end
@@ -990,10 +1001,6 @@ module QUIC
         end
         @pending_reset_streams.clear
 
-        # 1. Drain retransmission queue — one frame per send call to stay within MTU
-        if !@lost_frames.empty?
-          packet.frames << @lost_frames.shift
-        end
         # 2. Datagrams
         while !@queued_datagrams.empty?
           packet.frames << DatagramFrame.new(@queued_datagrams.shift)
@@ -1018,7 +1025,19 @@ module QUIC
           end
         end
       end
-      
+
+      # Drain retransmission queue — runs for ALL spaces (Initial/Handshake/App).
+      # CryptoFrame retransmissions must use the original packet space so the peer
+      # can decrypt them with the correct keys.  Placed outside the app-only
+      # congestion-control block above so Handshake-space PTO retransmits are not
+      # silently dropped.
+      if !@lost_frames.empty?
+        sid = space_id(space)
+        if @lost_frames.first[0] == sid
+          packet.frames << @lost_frames.shift[1]
+        end
+      end
+
       return 0 if packet.frames.empty?
       
       @send_payload_io.clear

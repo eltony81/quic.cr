@@ -56,6 +56,7 @@ module QUIC
       property delivered : UInt64 = 0
       property delivered_time : Time = Time.local
       property frames : Array(Frame) = [] of Frame
+      property space_id : Int32 = 2
 
       def initialize(@packet_number, @time_sent, @bytes, @ack_eliciting = true)
       end
@@ -68,6 +69,7 @@ module QUIC
       return unless ack_eliciting
       packet = SentPacket.new(pn, Time.local, bytes.to_u32, ack_eliciting)
       packet.frames = frames
+      packet.space_id = space_id
       packet.delivered = @bbr_delivered
       packet.delivered_time = @bbr_delivered_time
       @sent_packets[{space_id, pn}] = packet

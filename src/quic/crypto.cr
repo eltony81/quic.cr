@@ -198,7 +198,7 @@ module QUIC
     end
 
     def self.derive_next_secret(secret : Bytes) : Bytes
-      hkdf_expand_label(secret, "ku", Bytes.empty, 32)
+      hkdf_expand_label(secret, "quic ku", Bytes.empty, 32)
     end
 
     # RFC 9369 §3.3: QUIC v2 key update uses "quicv2 ku" label.
@@ -241,7 +241,7 @@ module QUIC
     end
 
     def self.derive_next_secret_sha384(secret : Bytes) : Bytes
-      hkdf_expand_label_sha384(secret, "ku", Bytes.empty, 48)
+      hkdf_expand_label_sha384(secret, "quic ku", Bytes.empty, 48)
     end
 
     class HeaderProtection

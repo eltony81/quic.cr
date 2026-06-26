@@ -70,7 +70,10 @@ module H3
       LibC.setsockopt(udp.fd, LibSys::IPPROTO_IP, LibSys::IP_TOS, pointerof(tos).as(Void*), sizeof(Int32).to_u32)
       @udp_socket = udp
       batch_receiver = QUIC::BatchReceiver.new(udp)
-      batch_receiver.enable_gro!(udp)
+      # GRO merges multiple short-header QUIC packets into one recv() buffer.
+      # Short headers have no Length field, so merged segments can't be split
+      # without the UDP_GRO cmsg.  Leave GRO disabled until cmsg handling is added.
+      # batch_receiver.enable_gro!(udp)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
 
       # Router-only state — never touched by actor fibers (no mutex needed).
