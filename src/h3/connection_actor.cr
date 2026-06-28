@@ -54,6 +54,7 @@ module H3
       @out_buf = Bytes.new(65536)
       @fwd_buf = Bytes.new(65536)
       @batch_sender = QUIC::BatchSender.new(@udp)
+      @batch_sender.enable_gso!(@udp)
       spawn(name: "actor-#{@initial_key[0, 8]}") { run }
     end
 

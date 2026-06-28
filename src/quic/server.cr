@@ -20,6 +20,7 @@ module QUIC
       buffer = Bytes.new(2048)
       out_buf = Bytes.new(2048)
       batch_sender = BatchSender.new(@socket)
+      batch_sender.enable_gso!(@socket)
       loop do
         size, client_addr = @socket.receive(buffer)
         data = buffer[0, size]
