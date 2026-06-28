@@ -219,9 +219,7 @@ type result struct {
 	throughputMB float64
 }
 
-func bench(label, base string, seqN, concN, concC, tpN int) result {
-	tr := newTransport()
-	defer tr.Close()
+func bench(label, base string, seqN, concN, concC, tpN int, tr *http3.Transport) result {
 	c := &http.Client{Transport: tr}
 
 
@@ -370,28 +368,33 @@ func main() {
 	fmt.Printf("Config: seq=%d  conc=%d/%d workers  tp=%d×100k\n",
 		*seqN, *concN, *concC, *tpN)
 
-	// Warm-up: 30 requests to each server (discarded)
-	fmt.Print("Warming up")
-	for _, base := range []string{crystalBase, goBase} {
-		tr := newTransport()
-		c := &http.Client{Transport: tr}
-		for i := 0; i < 30; i++ {
-			resp, err := c.Get(base + "/ping")
-			if err == nil {
-				io.Copy(io.Discard, resp.Body) //nolint:errcheck
-				resp.Body.Close()
-			}
-		}
-		tr.Close()
-		fmt.Print(".")
-	}
-	fmt.Println(" done")
-
 	fmt.Println("\nBenchmarking Crystal quic.cr…")
-	crRes := bench("Crystal quic.cr", crystalBase, *seqN, *concN, *concC, *tpN)
+	crTr := newTransport()
+	defer crTr.Close()
+	// Warm up Crystal transport to complete the handshake and OpenSSL init
+	cCr := &http.Client{Transport: crTr}
+	for i := 0; i < 30; i++ {
+		resp, err := cCr.Get(crystalBase + "/ping")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+		}
+	}
+	crRes := bench("Crystal quic.cr", crystalBase, *seqN, *concN, *concC, *tpN, crTr)
 
 	fmt.Println("Benchmarking Go quic-go…")
-	goRes := bench("Go quic-go", goBase, *seqN, *concN, *concC, *tpN)
+	goTr := newTransport()
+	defer goTr.Close()
+	// Warm up Go transport to complete the handshake
+	cGo := &http.Client{Transport: goTr}
+	for i := 0; i < 30; i++ {
+		resp, err := cGo.Get(goBase + "/ping")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+		}
+	}
+	goRes := bench("Go quic-go", goBase, *seqN, *concN, *concC, *tpN, goTr)
 
 	printReport(crRes, goRes)
 }
