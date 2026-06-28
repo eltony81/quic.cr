@@ -326,19 +326,17 @@ module H3
     # ── Private ────────────────────────────────────────────────────────────────
 
     private def extract_dcid(data : Bytes) : String
-      io      = IO::Memory.new(data)
-      first   = io.read_byte || 0_u8
+      return "unknown" if data.empty?
+      first = data[0]
       is_long = (first & 0x80) != 0
       if is_long
-        io.skip(4)   # version
-        len  = io.read_byte || 0_u8
-        dcid = Bytes.new(len)
-        io.read_fully(dcid)
-        dcid.hexstring
+        return "unknown" if data.size < 6
+        len = data[5].to_i
+        return "unknown" if data.size < 6 + len
+        data[6, len].hexstring
       else
-        dcid = Bytes.new(8)
-        io.read_fully(dcid)
-        dcid.hexstring
+        return "unknown" if data.size < 9
+        data[1, 8].hexstring
       end
     rescue e
       Log.debug { "extract_dcid failed: #{e.message}" }

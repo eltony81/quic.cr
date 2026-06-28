@@ -139,14 +139,12 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
       GC overhead per connection, masking real latency differences. A Go benchmark client
       (pure quic-go, no Python runtime) would give accurate latency measurements.
       Reference: `bench/benchmark.py` → target: `bench/go_client/bench_latency/`.
-- [ ] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
-      every long-header and short-header packet to decode the 1–4 byte packet number
-      (lines ~457–467, ~510–520). Replace with direct byte reads into a pre-allocated
-      `@pn_buf : Bytes` per `PacketNumberSpace`. Eliminates 2× small allocs per packet.
-- [ ] **Opt-4: Frame parsing buffer reuse** — `Frame.decode` allocates a new `IO::Memory`
-      for the entire payload on every packet. Pre-allocate a per-connection `@frame_io`
-      buffer and wrap it around the decrypted plaintext slice (which is already in
-      `@decrypt_buf`). Eliminates 1× `IO::Memory.new(payload_size)` per packet.
+- [x] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
+      every long-header and short-header packet to decode the 1–4 byte packet number.
+      Replaced with direct byte reads. Eliminates 2× small allocs per packet.
+- [x] **Opt-4: Frame parsing buffer reuse** — `Frame.decode` allocates a new `IO::Memory`
+      for the entire payload on every packet. Implemented `QUIC::SliceReader` to wrap
+      plaintext slice. Eliminates 1× `IO::Memory.new(payload_size)` per packet.
 - [ ] **Opt-5: GC tuning for large transfers** — Boehm GC's stop-the-world pauses
       dominate the 4x throughput gap vs Go. Options: `GC_enable_incremental()` via
       LibGC to overlap marking with mutator, or tune `GC_set_free_space_divisor` to
