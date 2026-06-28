@@ -10,10 +10,11 @@ CONC_N="${CONC_N:-1000}"
 CONC_C="${CONC_C:-50}"
 TP_N="${TP_N:-20}"
 
+SERVER_PIDS=()
 cleanup() {
-  if [[ -n "${SERVER_PID:-}" ]]; then
-    kill "$SERVER_PID" 2>/dev/null || true
-  fi
+  for pid in "${SERVER_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
@@ -31,9 +32,11 @@ echo "==> Building Go benchmark..."
 cd "$BENCH_DIR"
 go build -o bench_h3 .
 
-echo "==> Starting Crystal server on :4433..."
-GC_INITIAL_HEAP_SIZE=100M "$E2E_BIN" &
-SERVER_PID=$!
+echo "==> Starting Crystal server on :4433 (4 instances, SO_REUSEPORT)..."
+for i in {1..4}; do
+  GC_INITIAL_HEAP_SIZE=100M "$E2E_BIN" &
+  SERVER_PIDS+=($!)
+done
 sleep 0.8
 
 echo "==> Running benchmark..."

@@ -9,6 +9,7 @@ module QUIC
 
     def initialize(@config, address : String, port : Int32)
       @socket = UDPSocket.new
+      @socket.reuse_port = true
       @socket.bind(address, port)
       # ECN: ECT(0) on outgoing datagrams (RFC 9000 §13.4)
       tos = 2

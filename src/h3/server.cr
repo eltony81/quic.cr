@@ -62,6 +62,7 @@ module H3
       config.initial_max_stream_data_uni         = 10_000_000_u64
 
       udp = UDPSocket.new
+      udp.reuse_port = true
       udp.bind(host, port)
       # ECN: mark outgoing UDP datagrams as ECT(0) so network routers can signal
       # congestion via CE marks in ACK frames instead of dropping packets
