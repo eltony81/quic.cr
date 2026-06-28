@@ -289,12 +289,32 @@ func printReport(cr, go_ result) {
 	fmt.Println("├──────────────────────────────────────────────────────────────┤")
 
 	if go_.seqAvg > 0 && cr.seqAvg > 0 {
-		latRatio := float64(go_.seqAvg) / float64(cr.seqAvg)
-		rpsRatio := cr.concRPS / go_.concRPS
-		tpRatio  := cr.throughputMB / go_.throughputMB
-		fmt.Printf("  Latency  Crystal/Go:  %.2fx  (>1 = Crystal faster)\n", latRatio)
-		fmt.Printf("  RPS      Crystal/Go:  %.2fx  (>1 = Crystal faster)\n", rpsRatio)
-		fmt.Printf("  Throughput Crystal/Go: %.2fx  (>1 = Crystal faster)\n", tpRatio)
+		// Latency (lower is better)
+		if cr.seqAvg < go_.seqAvg {
+			ratio := float64(go_.seqAvg) / float64(cr.seqAvg)
+			fmt.Printf("  Latency:     Crystal is %.2fx faster than Go (avg: %s vs %s)\n", ratio, d(cr.seqAvg), d(go_.seqAvg))
+		} else {
+			ratio := float64(cr.seqAvg) / float64(go_.seqAvg)
+			fmt.Printf("  Latency:     Go is %.2fx faster than Crystal (avg: %s vs %s)\n", ratio, d(go_.seqAvg), d(cr.seqAvg))
+		}
+
+		// RPS (higher is better)
+		if cr.concRPS > go_.concRPS {
+			ratio := cr.concRPS / go_.concRPS
+			fmt.Printf("  RPS:         Crystal is %.2fx faster than Go (RPS: %.0f vs %.0f)\n", ratio, cr.concRPS, go_.concRPS)
+		} else {
+			ratio := go_.concRPS / cr.concRPS
+			fmt.Printf("  RPS:         Go is %.2fx faster than Crystal (RPS: %.0f vs %.0f)\n", ratio, go_.concRPS, cr.concRPS)
+		}
+
+		// Throughput (higher is better)
+		if cr.throughputMB > go_.throughputMB {
+			ratio := cr.throughputMB / go_.throughputMB
+			fmt.Printf("  Throughput:  Crystal is %.2fx faster than Go (MB/s: %.1f vs %.1f)\n", ratio, cr.throughputMB, go_.throughputMB)
+		} else {
+			ratio := go_.throughputMB / cr.throughputMB
+			fmt.Printf("  Throughput:  Go is %.2fx faster than Crystal (MB/s: %.1f vs %.1f)\n", ratio, go_.throughputMB, cr.throughputMB)
+		}
 	}
 	fmt.Println("└──────────────────────────────────────────────────────────────┘")
 	fmt.Println()
