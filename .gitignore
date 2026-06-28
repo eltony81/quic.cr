@@ -40,3 +40,8 @@ bench/go_client/bench_h3/bench_h3
 
 # Python cache
 examples/__pycache__/
+
+# LLM and AI Agents configuration
+CLAUDE.md
+/.claude/
+/.agents/
