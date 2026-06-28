@@ -46,6 +46,61 @@ SERVER_PIDS+=($!)
 
 sleep 0.8
 
+# Memory monitor function
+monitor_mem() {
+  local pids=("$@")
+  local go_pid="${pids[-1]}"
+  local len=${#pids[@]}
+  local cry_pids=("${pids[@]:0:$((len-1))}")
+  
+  local peak_crystal=0
+  local peak_go=0
+  
+  # When killed, save results and exit
+  trap '
+    echo "$peak_crystal" > /tmp/peak_crystal
+    echo "$peak_go" > /tmp/peak_go
+    exit 0
+  ' TERM
+  
+  while true; do
+    local cry_total=0
+    for pid in "${cry_pids[@]}"; do
+      local rss=$(ps -o rss= -p "$pid" 2>/dev/null | awk "{print \$1}" || echo 0)
+      cry_total=$((cry_total + rss))
+    done
+    if [ "$cry_total" -gt "$peak_crystal" ]; then
+      peak_crystal=$cry_total
+    fi
+
+    local go_rss=$(ps -o rss= -p "$go_pid" 2>/dev/null | awk "{print \$1}" || echo 0)
+    if [ "$go_rss" -gt "$peak_go" ]; then
+      peak_go=$go_rss
+    fi
+    sleep 0.05
+  done
+}
+
+echo "==> Starting memory monitor..."
+monitor_mem "${SERVER_PIDS[@]}" &
+MONITOR_PID=$!
+
 echo "==> Running benchmark..."
 cd "$BENCH_DIR"
 ./bench_h3 -seq-n "$SEQ_N" -conc-n "$CONC_N" -conc-c "$CONC_C" -tp-n "$TP_N"
+
+# Terminate memory monitor and read results
+kill -TERM "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+
+CRYSTAL_MB=$(awk "BEGIN {printf \"%.1f\", $(cat /tmp/peak_crystal || echo 0)/1024}")
+GO_MB=$(awk "BEGIN {printf \"%.1f\", $(cat /tmp/peak_go || echo 0)/1024}")
+
+echo ""
+echo "┌────────────────────────────────────────────────────────────────┐"
+echo "│         Memory Usage (Peak RSS) During Benchmark               │"
+echo "├──────────────────────────────┬──────────────────┬──────────────┤"
+echo "│  Crystal quic.cr (4 procs)   │  $CRYSTAL_MB MB         │"
+echo "│  Go quic-go (1 proc)         │  $GO_MB MB         │"
+echo "└──────────────────────────────┴──────────────────┴──────────────┘"
+
