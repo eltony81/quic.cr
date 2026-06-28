@@ -15,7 +15,7 @@ module QUIC
     # Initial congestion window in MTU-sized packets (RFC 9002 §7.2).
     # Default 32 is more aggressive than the RFC minimum of 10 but safe for
     # modern server workloads; increase further for known-good LAN paths.
-    property initial_cwnd_packets : UInt32 = 32_u32
+    property initial_cwnd_packets : UInt32 = 128_u32
 
     property cert_file : String = "cert.pem"
     property key_file : String = "key.pem"
