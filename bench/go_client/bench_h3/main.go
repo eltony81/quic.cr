@@ -224,6 +224,15 @@ func bench(label, base string, seqN, concN, concC, tpN int) result {
 	defer tr.Close()
 	c := &http.Client{Transport: tr}
 
+	// Connection warm-up: perform 10 requests to complete TLS handshake and warm OpenSSL
+	for i := 0; i < 10; i++ {
+		resp, err := c.Get(base + "/ping")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+		}
+	}
+
 	lats, serr := runSeq(c, base+"/ping", seqN)
 	if serr > 0 {
 		fmt.Fprintf(os.Stderr, "  [%s] seq errors: %d\n", label, serr)
