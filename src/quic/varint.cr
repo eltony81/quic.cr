@@ -42,6 +42,11 @@ module QUIC
       io.to_slice
     end
 
+    # Decodes a QUIC variable-length integer from a SliceReader without virtual calls.
+    def self.decode(io : SliceReader) : UInt64
+      io.read_varint
+    end
+
     # Decodes a QUIC variable-length integer from an IO without allocations.
     def self.decode(io : IO) : UInt64
       first_byte = io.read_byte || raise BufferTooShort.new
