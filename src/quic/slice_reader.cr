@@ -38,6 +38,13 @@ module QUIC
       count
     end
 
+    def read_byte : UInt8?
+      return nil if @pos >= @slice.size
+      byte = @slice[@pos]
+      @pos += 1
+      byte
+    end
+
     def write(slice : Bytes) : Nil
       raise IO::Error.new("SliceReader is read-only")
     end
