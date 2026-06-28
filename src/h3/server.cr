@@ -254,7 +254,7 @@ module H3
           ctx.response.text("Internal Server Error", 500)
         end
 
-        h3_conn.write_response(stream, response.to_h3_headers, response.body_bytes)
+        h3_conn.write_response(stream, ctx.response.to_h3_headers, ctx.response.body_bytes)
 
       elsif handler = @low_level_handler
         # ---- Mode 1: Low-level block handler (backwards-compatible) ---------

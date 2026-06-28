@@ -1,5 +1,5 @@
 module QUIC
-  abstract class Packet
+  abstract struct Packet
     abstract def type : PacketType
     
     # Decodes a packet from an IO.

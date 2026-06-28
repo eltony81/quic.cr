@@ -7,7 +7,7 @@ module QUIC
     Short     = 0x04 # 1-RTT
   end
 
-  abstract class Packet
+  abstract struct Packet
     abstract def type : PacketType
     property frames = [] of Frame
     property packet_number : UInt64 = 0
@@ -17,7 +17,7 @@ module QUIC
     abstract def first_byte : UInt8
   end
 
-  class LongHeaderPacket < Packet
+  struct LongHeaderPacket < Packet
     getter type : PacketType
     getter version : UInt32
     getter dcid : Bytes
@@ -77,7 +77,7 @@ module QUIC
     end
   end
 
-  class RetryPacket < Packet
+  struct RetryPacket < Packet
     getter version : UInt32
     getter dcid : Bytes
     getter scid : Bytes
@@ -115,7 +115,7 @@ module QUIC
     end
   end
 
-  class VersionNegotiationPacket < Packet
+  struct VersionNegotiationPacket < Packet
     getter dcid : Bytes
     getter scid : Bytes
     getter supported_versions : Array(UInt32)
@@ -148,7 +148,7 @@ module QUIC
     end
   end
 
-  class ShortHeaderPacket < Packet
+  struct ShortHeaderPacket < Packet
     def type : PacketType
       PacketType::Short
     end

@@ -23,7 +23,7 @@ module QUIC
     DATAGRAM            = 0x30 # RFC 9221
   end
 
-  abstract class Frame
+  abstract struct Frame
     abstract def type : FrameType
     abstract def encode(io : IO)
 
@@ -143,17 +143,17 @@ module QUIC
     end
   end
 
-  class PaddingFrame < Frame
+  struct PaddingFrame < Frame
     def type : FrameType; FrameType::PADDING; end
     def encode(io : IO); VarInt.write(io, type.to_u64); end
   end
 
-  class PingFrame < Frame
+  struct PingFrame < Frame
     def type : FrameType; FrameType::PING; end
     def encode(io : IO); VarInt.write(io, type.to_u64); end
   end
 
-  class CryptoFrame < Frame
+  struct CryptoFrame < Frame
     getter offset : UInt64
     getter data : Bytes
     def initialize(@offset, @data); end
@@ -166,7 +166,7 @@ module QUIC
     end
   end
 
-  class MaxDataFrame < Frame
+  struct MaxDataFrame < Frame
     getter maximum_data : UInt64
     def initialize(@maximum_data); end
     def type : FrameType; FrameType::MAX_DATA; end
@@ -176,7 +176,7 @@ module QUIC
     end
   end
 
-  class MaxStreamDataFrame < Frame
+  struct MaxStreamDataFrame < Frame
     getter stream_id : UInt64
     getter maximum_stream_data : UInt64
     def initialize(@stream_id, @maximum_stream_data); end
@@ -188,7 +188,7 @@ module QUIC
     end
   end
 
-  class DataBlockedFrame < Frame
+  struct DataBlockedFrame < Frame
     getter maximum_data : UInt64
     def initialize(@maximum_data); end
     def type : FrameType; FrameType::DATA_BLOCKED; end
@@ -198,7 +198,7 @@ module QUIC
     end
   end
 
-  class StreamDataBlockedFrame < Frame
+  struct StreamDataBlockedFrame < Frame
     getter stream_id : UInt64
     getter maximum_stream_data : UInt64
     def initialize(@stream_id, @maximum_stream_data); end
@@ -210,7 +210,7 @@ module QUIC
     end
   end
 
-  class NewTokenFrame < Frame
+  struct NewTokenFrame < Frame
     getter token : Bytes
     def initialize(@token); end
     def type : FrameType; FrameType::NEW_TOKEN; end
@@ -221,7 +221,7 @@ module QUIC
     end
   end
 
-  class ResetStreamFrame < Frame
+  struct ResetStreamFrame < Frame
     getter id : UInt64
     getter error_code : UInt64
     getter final_size : UInt64
@@ -235,7 +235,7 @@ module QUIC
     end
   end
 
-  class StopSendingFrame < Frame
+  struct StopSendingFrame < Frame
     getter id : UInt64
     getter error_code : UInt64
     def initialize(@id, @error_code); end
@@ -247,7 +247,7 @@ module QUIC
     end
   end
 
-  class StreamFrame < Frame
+  struct StreamFrame < Frame
     getter id : UInt64
     getter offset : UInt64
     getter data : Bytes
@@ -265,7 +265,7 @@ module QUIC
     end
   end
 
-  class AckFrame < Frame
+  struct AckFrame < Frame
     getter largest_acknowledged : UInt64
     getter ack_delay : UInt64
     getter first_ack_range : UInt64
@@ -300,7 +300,7 @@ module QUIC
     end
   end
 
-  class MaxStreamsFrame < Frame
+  struct MaxStreamsFrame < Frame
     getter maximum_streams : UInt64
     getter bidirectional : Bool
     def initialize(@maximum_streams, @bidirectional); end
@@ -311,7 +311,7 @@ module QUIC
     end
   end
 
-  class StreamsBlockedFrame < Frame
+  struct StreamsBlockedFrame < Frame
     getter maximum_streams : UInt64
     getter bidirectional : Bool
     def initialize(@maximum_streams, @bidirectional); end
@@ -323,7 +323,7 @@ module QUIC
   end
 
 
-  class PathChallengeFrame < Frame
+  struct PathChallengeFrame < Frame
     getter data : Bytes
     def initialize(@data)
       raise ArgumentError.new("PathChallenge data must be 8 bytes") if @data.size != 8
@@ -335,7 +335,7 @@ module QUIC
     end
   end
 
-  class PathResponseFrame < Frame
+  struct PathResponseFrame < Frame
     getter data : Bytes
     def initialize(@data)
       raise ArgumentError.new("PathResponse data must be 8 bytes") if @data.size != 8
@@ -347,7 +347,7 @@ module QUIC
     end
   end
 
-  class NewConnectionIdFrame < Frame
+  struct NewConnectionIdFrame < Frame
     getter sequence_number : UInt64
     getter retire_prior_to : UInt64
     getter connection_id : Bytes
@@ -367,7 +367,7 @@ module QUIC
     end
   end
 
-  class RetireConnectionIdFrame < Frame
+  struct RetireConnectionIdFrame < Frame
     getter sequence_number : UInt64
     def initialize(@sequence_number); end
     def type : FrameType; FrameType::RETIRE_CONNECTION_ID; end
@@ -377,12 +377,12 @@ module QUIC
     end
   end
 
-  class HandshakeDoneFrame < Frame
+  struct HandshakeDoneFrame < Frame
     def type : FrameType; FrameType::HANDSHAKE_DONE; end
     def encode(io : IO); VarInt.write(io, type.to_u64); end
   end
 
-  class DatagramFrame < Frame
+  struct DatagramFrame < Frame
     getter data : Bytes
     def initialize(@data); end
     def type : FrameType; FrameType::DATAGRAM; end
@@ -394,7 +394,7 @@ module QUIC
     end
   end
 
-  class ConnectionCloseFrame < Frame
+  struct ConnectionCloseFrame < Frame
     getter error_code : UInt64
     getter frame_type : UInt64
     getter reason : String
