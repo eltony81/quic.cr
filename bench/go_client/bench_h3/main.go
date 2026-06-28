@@ -118,7 +118,7 @@ func runSeq(client *http.Client, url string, n int) (lats []time.Duration, errCo
 
 // ── Concurrent RPS benchmark ─────────────────────────────────────────────────
 
-func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.Duration, errCount int) {
+func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.Duration, maxLat time.Duration, errCount int) {
 	lats := make([]time.Duration, 0, n)
 	var mu sync.Mutex
 	var errs int32
@@ -152,6 +152,7 @@ func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.D
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 	if len(lats) > 0 {
 		p99 = lats[int(float64(len(lats))*0.99)]
+		maxLat = lats[len(lats)-1]
 	}
 	rps = float64(len(lats)) / elapsed.Seconds()
 	errCount = int(errs)
@@ -211,8 +212,10 @@ type result struct {
 	seqAvg       time.Duration
 	seqP50       time.Duration
 	seqP99       time.Duration
+	seqMax       time.Duration
 	concRPS      float64
 	concP99      time.Duration
+	concMax      time.Duration
 	throughputMB float64
 }
 
@@ -226,7 +229,7 @@ func bench(label, base string, seqN, concN, concC, tpN int) result {
 		fmt.Fprintf(os.Stderr, "  [%s] seq errors: %d\n", label, serr)
 	}
 
-	rps, cp99, cerr := runConc(c, base+"/ping", concN, concC)
+	rps, cp99, cmax, cerr := runConc(c, base+"/ping", concN, concC)
 	if cerr > 0 {
 		fmt.Fprintf(os.Stderr, "  [%s] conc errors: %d\n", label, cerr)
 	}
@@ -236,13 +239,20 @@ func bench(label, base string, seqN, concN, concC, tpN int) result {
 		fmt.Fprintf(os.Stderr, "  [%s] throughput errors: %d\n", label, terr)
 	}
 
+	var seqMax time.Duration
+	if len(lats) > 0 {
+		seqMax = lats[len(lats)-1]
+	}
+
 	return result{
 		label:        label,
 		seqAvg:       avgDur(lats),
 		seqP50:       pct(lats, 0.50),
 		seqP99:       pct(lats, 0.99),
+		seqMax:       seqMax,
 		concRPS:      rps,
 		concP99:      cp99,
+		concMax:      cmax,
 		throughputMB: mbps,
 	}
 }
@@ -268,10 +278,12 @@ func printReport(cr, go_ result) {
 	row("    avg", d(cr.seqAvg), d(go_.seqAvg))
 	row("    p50", d(cr.seqP50), d(go_.seqP50))
 	row("    p99", d(cr.seqP99), d(go_.seqP99))
+	row("    max", d(cr.seqMax), d(go_.seqMax))
 	fmt.Println("│                                                               │")
 	fmt.Println("│  Concurrent (GET /ping)                                       │")
 	row("    req/s", r(cr.concRPS), r(go_.concRPS))
 	row("    p99 latency", d(cr.concP99), d(go_.concP99))
+	row("    max latency", d(cr.concMax), d(go_.concMax))
 	fmt.Println("│                                                               │")
 	fmt.Println("│  Throughput (GET /100k)                                       │")
 	row("    MB/s", m(cr.throughputMB), m(go_.throughputMB))
