@@ -32,7 +32,7 @@ cd "$BENCH_DIR"
 go build -o bench_h3 .
 
 echo "==> Starting Crystal server on :4433..."
-"$E2E_BIN" &
+GC_INITIAL_HEAP_SIZE=100M "$E2E_BIN" &
 SERVER_PID=$!
 sleep 0.8
 
