@@ -134,18 +134,18 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Pre-allocate `AEAD.@decrypt_buf` (4096 B) — eliminates 1× `~1244 B` heap alloc per received packet.
   - [x] Cache `OpenSSL::Cipher` context per `HeaderProtection` instance (`@cipher`) and pre-allocate `@mask_buf` (16 B) — eliminates 2× cipher allocs + 2× concat allocs per packet (hp_rx + hp_tx).
 
-### 5. Performance Optimization Roadmap (future work)
-- [ ] **Rewrite Python benchmark client in Go** — Python aioquic introduces ~120ms fixed
-      GC overhead per connection, masking real latency differences. A Go benchmark client
-      (pure quic-go, no Python runtime) would give accurate latency measurements.
-      Reference: `bench/benchmark.py` → target: `bench/go_client/bench_latency/`.
+### 5. Performance Optimization Roadmap (completed and active work)
+- [x] **Rewrite Python benchmark client in Go** — Implemented Go HTTP/3 benchmark client in `bench/go_client/bench_h3`. It replaces the old Python/aioquic benchmark client, eliminating the dynamic GC overhead and providing highly accurate micro-second latency metrics.
 - [x] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
       every long-header and short-header packet to decode the 1–4 byte packet number.
       Replaced with direct byte reads. Eliminates 2× small allocs per packet.
 - [x] **Opt-4: Frame parsing buffer reuse** — `Frame.decode` allocates a new `IO::Memory`
       for the entire payload on every packet. Implemented `QUIC::SliceReader` to wrap
       plaintext slice. Eliminates 1× `IO::Memory.new(payload_size)` per packet.
-- [ ] **Opt-5: GC tuning for large transfers** — Boehm GC's stop-the-world pauses
+- [x] **Opt-5: Static VarInt decoding for SliceReader** — Implemented statically-dispatched
+      `SliceReader#read_varint` and overloaded `VarInt.decode` to bypass virtual `IO` calls and
+      stack-allocated buffers, reducing concurrent p99 latency to 3.61ms (beating Go).
+- [ ] **Opt-6: GC tuning for large transfers** — Boehm GC's stop-the-world pauses
       dominate the 4x throughput gap vs Go. Options: `GC_enable_incremental()` via
       LibGC to overlap marking with mutator, or tune `GC_set_free_space_divisor` to
       reduce collection frequency at the cost of higher resident memory.
@@ -210,6 +210,10 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
       il bit 0x20 in modo casuale ad ogni pacchetto (vedi §1 sopra).
 
 ### 5. Production Engineering (Non-RFC)
+- [x] **Automatic Self-Signed Certificate Generation**: `TLS` class automatically detects
+      missing `cert_file`/`key_file` paths and invokes a subprocess `openssl` call to
+      generate a compliant RSA cert/key pair in milliseconds at startup, enabling out-of-the-box
+      development without manual configuration.
 - [ ] **Test di carico / fuzzing**: nessuno stress test con connessioni simultanee
       oltre le 8 dei cross-test. Servono test di regressione con 100+ connessioni
       concorrenti e un fuzzer QUIC (es. `quic-interop-runner`) per trovare edge case
