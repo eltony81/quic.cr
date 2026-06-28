@@ -254,20 +254,17 @@ module H3
           ctx.response.text("Internal Server Error", 500)
         end
 
-        h3_conn.write_frame(stream, HeadersFrame.new(response.to_h3_headers))
-        body_bytes = response.body_bytes
-        h3_conn.write_frame(stream, DataFrame.new(body_bytes)) unless body_bytes.empty?
+        h3_conn.write_response(stream, response.to_h3_headers, response.body_bytes)
 
       elsif handler = @low_level_handler
         # ---- Mode 1: Low-level block handler (backwards-compatible) ---------
         begin
           resp_headers, resp_body = handler.call(req_frame.headers, body)
-          h3_conn.write_frame(stream, HeadersFrame.new(resp_headers))
-          h3_conn.write_frame(stream, DataFrame.new(resp_body)) unless resp_body.empty?
+          h3_conn.write_response(stream, resp_headers, resp_body)
         rescue e
           Log.error(exception: e) { "Low-level handler exception" }
           error_resp = {":status" => "500"}
-          h3_conn.write_frame(stream, HeadersFrame.new(error_resp))
+          h3_conn.write_response(stream, error_resp)
         end
       end
 
