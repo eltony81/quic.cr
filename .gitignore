@@ -32,6 +32,8 @@ benchmark/__pycache__/
 
 # bench/ compiled binaries (source stays, binaries go)
 bench/go_server/go_h3_server
+bench/go_client/go_h3_client
+bench/go_client/bench_h3/bench_h3
 
 # Root-level built binary
 /quic

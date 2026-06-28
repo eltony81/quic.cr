@@ -49,15 +49,11 @@ module H3
     end
 
     # Idempotent: safe to call more than once.
+    # Pushes to the actor's lock-free response ring — never blocks.
     def close_local
       return if @sent
       @sent = true
-      response_data = @write_buf.to_slice.dup
-      select
-      when @actor.response_chan.send({@stream_id, response_data})
-      when timeout(5.seconds)
-        Log.warn { "stream #{@stream_id}: response_chan send timed out — actor may have crashed" }
-      end
+      @actor.push_response(@stream_id, @write_buf.to_slice.dup)
     end
   end
 end

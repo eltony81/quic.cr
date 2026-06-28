@@ -11,6 +11,10 @@ module H3
     getter peer_goaway_stream_id : UInt64?
     property peer_goaway_stream_id : UInt64?
 
+    # MAX_PUSH_ID: the maximum push ID the client has authorised (RFC 9114 §4.6).
+    # Nil means the client has not sent MAX_PUSH_ID → server push is forbidden.
+    property peer_max_push_id : UInt64? = nil
+
     # Persistent QPACK encoder/decoder — shared across all header frames on
     # this connection so the dynamic table accumulates compression state.
     @qpack_encoder = QPACK::Encoder.new
@@ -39,7 +43,8 @@ module H3
           stream_id = qsi * 4
           rest = raw[io.pos..]
           @on_h3_datagram.try &.call(stream_id, rest)
-        rescue
+        rescue e
+          Log.debug { "H3 datagram decode error: #{e.message}" }
         end
       }
     end
@@ -145,6 +150,14 @@ module H3
       push_response_headers : Hash(String, String),
       push_body             : Bytes
     ) : UInt64
+      # RFC 9114 §4.6: the server MUST NOT push if the client has not sent
+      # MAX_PUSH_ID, or if the next push_id would exceed the client's limit.
+      max = @peer_max_push_id
+      if max.nil? || @next_push_id > max
+        Log.debug { "server_push skipped: peer_max_push_id=#{max.inspect}, next_push_id=#{@next_push_id}" }
+        return @next_push_id
+      end
+
       push_id = @next_push_id
       @next_push_id += 1
 
@@ -260,6 +273,17 @@ module H3
       end
     end
 
+    # Applies the remote peer's SETTINGS to our encoder and other connection state.
+    # Called when we receive a SettingsFrame on the peer's control stream.
+    def apply_remote_settings(settings : Hash(UInt64, UInt64))
+      # 0x01 = QPACK_MAX_TABLE_CAPACITY: how much dynamic table the peer's decoder supports.
+      # If > 0, enable our encoder's dynamic table up to that capacity.
+      if (cap = settings[0x01_u64]?) && cap > 0
+        @qpack_encoder.set_capacity(cap)
+        flush_encoder_stream
+      end
+    end
+
     # RFC 9000 §4.6: raise if the peer's stream limit would be exceeded.
     # `next_id` is the next stream ID we would use; divide by 4 to get the
     # ordinal (stream IDs are 4k+offset).  A limit of 0 means "not yet known"
@@ -268,6 +292,7 @@ module H3
       return if limit == 0
       ordinal = next_id / 4
       if ordinal >= limit
+        @quic.queue_streams_blocked(kind == "bidi", limit)
         raise QUIC::ProtocolViolation.new(
           "#{kind} stream limit exceeded (limit=#{limit}, ordinal=#{ordinal})"
         )

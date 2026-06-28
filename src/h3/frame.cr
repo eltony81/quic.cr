@@ -106,6 +106,21 @@ module H3
     end
   end
 
+  # MAX_PUSH_ID frame (RFC 9114 §7.2.7): client → server, authorises push IDs up to
+  # the given value. The server MUST NOT push resources with higher push IDs.
+  class MaxPushIdFrame < Frame
+    getter push_id : UInt64
+    def initialize(@push_id); end
+    def type : FrameType; FrameType::MAX_PUSH_ID; end
+    def encode(io : IO)
+      payload = IO::Memory.new
+      QUIC::VarInt.write(payload, @push_id)
+      QUIC::VarInt.write(io, type.to_u64)
+      QUIC::VarInt.write(io, payload.size.to_u64)
+      io.write payload.to_slice
+    end
+  end
+
   # Sent on the control stream to initiate graceful shutdown (RFC 9114 §7.2.6).
   # The payload is a single VarInt: the ID of the last request stream the sender
   # will process. Streams with IDs higher than this must be retried by the client.
@@ -194,6 +209,11 @@ module H3
         io.read_fully(buf)
         stream_id = QUIC::VarInt.decode(IO::Memory.new(buf))
         GoAwayFrame.new(stream_id)
+      when FrameType::MAX_PUSH_ID.to_u64
+        buf = Bytes.new(length)
+        io.read_fully(buf)
+        push_id = QUIC::VarInt.decode(IO::Memory.new(buf))
+        MaxPushIdFrame.new(push_id)
       when 0xF0700_u64, 0xF0701_u64
         # PRIORITY_UPDATE (RFC 9218) — parse and expose, no enforcement.
         buf = Bytes.new(length)

@@ -8,12 +8,12 @@
 
 Usage (from repo root):
     source venv/bin/activate
-    python benchmark/bench.py [--requests N] [--concurrency C] [--warmup W]
+    python bench/bench.py [--requests N] [--concurrency C] [--warmup W]
 
 Build servers first:
-    crystal build benchmark/crystal_server.cr        -o benchmark/crystal_server --release
-    crystal build benchmark/crystal_http_server.cr   -o benchmark/crystal_http_server --release
-    cd benchmark/go-server && go build -o ../go_server .
+    crystal build bench/crystal_server.cr        -o bench/crystal_server --release
+    crystal build bench/crystal_http_server.cr   -o bench/crystal_http_server --release
+    cd bench/go_server_3way && go build -o ../go_server_3way_bin .
 """
 
 import argparse
@@ -57,7 +57,7 @@ CERT         = os.path.join(REPO_DIR, "cert.pem")
 KEY          = os.path.join(REPO_DIR, "key.pem")
 
 CRYSTAL_H3_BIN   = os.path.join(SCRIPT_DIR, "crystal_server")
-GO_BIN           = os.path.join(SCRIPT_DIR, "go_server")
+GO_BIN           = os.path.join(SCRIPT_DIR, "go_server_3way_bin")
 CRYSTAL_HTTP_BIN = os.path.join(SCRIPT_DIR, "crystal_http_server")
 
 CRYSTAL_H3_PORT   = 4433
@@ -376,9 +376,9 @@ async def main_async(args):
         for p in missing:
             print(f"\n  {RE}✗{R}  {p} not found.")
         print(f"\n  Build with:")
-        print(f"    crystal build benchmark/crystal_server.cr      -o benchmark/crystal_server --release")
-        print(f"    crystal build benchmark/crystal_http_server.cr -o benchmark/crystal_http_server --release")
-        print(f"    cd benchmark/go-server && go build -o ../go_server .")
+        print(f"    crystal build bench/crystal_server.cr      -o bench/crystal_server --release")
+        print(f"    crystal build bench/crystal_http_server.cr -o bench/crystal_http_server --release")
+        print(f"    cd bench/go_server_3way && go build -o ../go_server_3way_bin .")
         sys.exit(1)
 
     print(f"\n{B}Starting servers…{R}")

@@ -130,6 +130,27 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
   - [x] Implement `QUIC::BufferPool` — thread-safe pool of reusable `Bytes` slices (lease/return/borrow).
   - [x] `H3::Server.listen` receiver fiber leases a buffer per packet and returns it immediately after copy.
   - [x] Optimize AEAD functions to process buffers in-place: cached `@nonce` (zero alloc per call) + `update_into`/`gcm_get_tag_into` write directly into a single pre-allocated result buffer (1 alloc instead of 4+ intermediates).
+  - [x] Cache `OpenSSL::Cipher` context per `AEAD` instance (`@cipher_enc`, `@cipher_dec`) — eliminates 2× `EVP_CIPHER_CTX_new()` per received packet on the hot path (+47% RPS, 14k→21k req/s).
+  - [x] Pre-allocate `AEAD.@decrypt_buf` (4096 B) — eliminates 1× `~1244 B` heap alloc per received packet.
+  - [x] Cache `OpenSSL::Cipher` context per `HeaderProtection` instance (`@cipher`) and pre-allocate `@mask_buf` (16 B) — eliminates 2× cipher allocs + 2× concat allocs per packet (hp_rx + hp_tx).
+
+### 5. Performance Optimization Roadmap (future work)
+- [ ] **Rewrite Python benchmark client in Go** — Python aioquic introduces ~120ms fixed
+      GC overhead per connection, masking real latency differences. A Go benchmark client
+      (pure quic-go, no Python runtime) would give accurate latency measurements.
+      Reference: `bench/benchmark.py` → target: `bench/go_client/bench_latency/`.
+- [ ] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
+      every long-header and short-header packet to decode the 1–4 byte packet number
+      (lines ~457–467, ~510–520). Replace with direct byte reads into a pre-allocated
+      `@pn_buf : Bytes` per `PacketNumberSpace`. Eliminates 2× small allocs per packet.
+- [ ] **Opt-4: Frame parsing buffer reuse** — `Frame.decode` allocates a new `IO::Memory`
+      for the entire payload on every packet. Pre-allocate a per-connection `@frame_io`
+      buffer and wrap it around the decrypted plaintext slice (which is already in
+      `@decrypt_buf`). Eliminates 1× `IO::Memory.new(payload_size)` per packet.
+- [ ] **Opt-5: GC tuning for large transfers** — Boehm GC's stop-the-world pauses
+      dominate the 4x throughput gap vs Go. Options: `GC_enable_incremental()` via
+      LibGC to overlap marking with mutator, or tune `GC_set_free_space_divisor` to
+      reduce collection frequency at the cost of higher resident memory.
 
 ## Phase 7: RFC Compliance & Interoperability Gaps
 

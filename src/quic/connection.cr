@@ -77,6 +77,8 @@ module QUIC
     @max_streams_bidi_local   : UInt64 = 128_u64  # overwritten in initialize from config
     @peer_streams_bidi_opened : UInt64 = 0_u64    # highest peer-initiated bidi ordinal seen
     @pending_max_streams_bidi : UInt64 = 0_u64    # >0 → emit MAX_STREAMS on next send
+    @pending_streams_blocked_bidi : UInt64 = 0_u64  # >0 → emit STREAMS_BLOCKED(bidi) on next send
+    @pending_streams_blocked_uni  : UInt64 = 0_u64  # >0 → emit STREAMS_BLOCKED(uni) on next send
 
     # Server queues one HANDSHAKE_DONE frame immediately after handshake completes.
     @pending_handshake_done : Bool = false
@@ -123,8 +125,8 @@ module QUIC
     end
 
     @pending_path_responses = [] of Bytes
-    @pending_path_challenges = [] of Bytes     # queued to send as PATH_CHALLENGE
-    @outstanding_path_challenges = Set(String).new  # sent, awaiting PATH_RESPONSE
+    @pending_path_challenges = [] of {Bytes, UInt64}  # (data, path_id) queued to send
+    @outstanding_path_challenges = {} of String => UInt64  # hex => path_id
     getter? path_validated : Bool = false
 
     property? version_negotiation_failed : Bool = false
@@ -157,6 +159,7 @@ module QUIC
     
     @pending_initial_tls : Bytes? = nil
     @pending_handshake_tls : Bytes? = nil
+    @pending_app_tls : Bytes? = nil
     @remote_tp_applied : Bool = false
 
     @initial_handshake_bytes = IO::Memory.new
@@ -228,6 +231,7 @@ module QUIC
         tp.initial_max_streams_bidi = @config.initial_max_streams_bidi
         tp.initial_max_streams_uni = @config.initial_max_streams_uni
         tp.initial_source_connection_id = @scid
+        tp.max_datagram_frame_size = 65535_u64  # RFC 9221: advertise datagram support
         @tls.update_local_tp(tp)
       end
     end
@@ -291,13 +295,13 @@ module QUIC
 
         data.size
       rescue e : QUIC::Error
-        STDERR.puts "CLOSE[proto]: #{e.class} #{e.message} largest_rx=#{@space_app.largest_received_pn}"
+        Log.error { "QUIC protocol error (pn=#{@space_app.largest_received_pn}): #{e.class} — #{e.message}" }
         @closed = true
         @close_error = e.error_code
         @close_reason = e.message || "Protocol Error"
         0
       rescue e : Exception
-        STDERR.puts "CLOSE[internal]: #{e.class} #{e.message} largest_rx=#{@space_app.largest_received_pn}"
+        Log.error(exception: e) { "QUIC internal error (pn=#{@space_app.largest_received_pn}): #{e.class}" }
         @closed = true
         @close_error = QUIC::ErrorCode::INTERNAL_ERROR
         @close_reason = "Internal Error"
@@ -359,6 +363,7 @@ module QUIC
           tp.initial_max_streams_uni = @config.initial_max_streams_uni
           tp.original_destination_connection_id = dcid
           tp.initial_source_connection_id = @scid.not_nil!
+          tp.max_datagram_frame_size = 65535_u64  # RFC 9221: advertise datagram support
           # RFC 9369 §3.4: chosen_version must reflect the version actually in use.
           other = @quic_version == Crypto::QUIC_V2_VERSION ? Crypto::QUIC_V1_VERSION : Crypto::QUIC_V2_VERSION
           tp.quic_version_information = {@quic_version, [other]}
@@ -533,7 +538,7 @@ module QUIC
             end
           end
         rescue ex_outer
-          STDERR.puts "PN-FAIL: full_pn=#{full_pn} trunc_pn=#{trunc_pn} fallback=#{full_pn != trunc_pn} err=#{ex_outer.message}"
+          Log.warn { "decrypt fallback: full_pn=#{full_pn} trunc_pn=#{trunc_pn} retrying=#{full_pn != trunc_pn} err=#{ex_outer.message}" }
           if full_pn != trunc_pn
             pn = trunc_pn
             if peer_kp != @peer_key_phase
@@ -678,9 +683,13 @@ module QUIC
         # RFC 9000 §8.2.1: echo the same 8 bytes in a PATH_RESPONSE
         @pending_path_responses << frame.data
       when PathResponseFrame
-        # RFC 9000 §8.2.2: validate path if data matches an outstanding challenge
-        if @outstanding_path_challenges.delete(frame.data.hexstring)
+        # RFC 9000 §8.2.2: validate path; auto-switch active_path_id (RFC 9000 §9)
+        if pid = @outstanding_path_challenges.delete(frame.data.hexstring)
           @path_validated = true
+          if pid != @active_path_id
+            self.active_path_id = pid
+            Log.debug { "Connection migration: switched active path to #{pid}" }
+          end
         end
       when ResetStreamFrame
         # RFC 9000 §3.4: peer aborted its send side — unblock any waiting reader.
@@ -810,12 +819,11 @@ module QUIC
       @close_reason = reason
     end
 
-    # Queue a PATH_CHALLENGE to validate a new or migrated path (RFC 9000 §8.2).
-    # Returns the 8-byte challenge data; path is considered validated when we
-    # receive a matching PATH_RESPONSE.
-    def initiate_path_validation : Bytes
+    # Queue a PATH_CHALLENGE to validate a path (RFC 9000 §8.2).
+    # On matching PATH_RESPONSE, active_path_id is switched to path_id (RFC 9000 §9).
+    def initiate_path_validation(path_id : UInt64 = @active_path_id) : Bytes
       challenge = Random::Secure.random_bytes(8)
-      @pending_path_challenges << challenge
+      @pending_path_challenges << {challenge, path_id}
       @path_validated = false
       challenge
     end
@@ -869,6 +877,18 @@ module QUIC
         end
       end
 
+      # Poll 1-RTT TLS data (NewSessionTicket, KeyUpdate) — only after 1-RTT keys exist.
+      if @space_app.aead_tx && (raw_app = @tls.poll_app)
+        if existing = @pending_app_tls
+          temp = Bytes.new(existing.size + raw_app.size)
+          existing.copy_to(temp[0, existing.size])
+          raw_app.copy_to(temp[existing.size, raw_app.size])
+          @pending_app_tls = temp
+        else
+          @pending_app_tls = raw_app
+        end
+      end
+
       # Select the space and tls_data to send
       if existing = @pending_initial_tls
         space = @space_initial
@@ -887,6 +907,15 @@ module QUIC
         else
           tls_data = existing
           @pending_handshake_tls = nil
+        end
+      elsif existing = @pending_app_tls
+        space = @space_app
+        if existing.size > 1000
+          tls_data = existing[0, 1000]
+          @pending_app_tls = existing[1000, existing.size - 1000]
+        else
+          tls_data = existing
+          @pending_app_tls = nil
         end
       elsif @space_initial.pending_ack
         space = @space_initial
@@ -917,7 +946,7 @@ module QUIC
         tls_data = nil
       end
 
-      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @pending_path_challenges.empty? && @lost_frames.empty? && !@pending_handshake_done && @pending_reset_streams.empty?
+      if tls_data.nil? && !space.pending_ack && !(@closed && !@close_sent) && @streams.all? { |_, s| !s.has_send_data? } && @pending_path_responses.empty? && @pending_path_challenges.empty? && @lost_frames.empty? && !@pending_handshake_done && @pending_reset_streams.empty? && @pending_streams_blocked_bidi == 0 && @pending_streams_blocked_uni == 0 && @queued_datagrams.empty? && @pending_app_tls.nil?
         Log.trace { "SEND DEBUG: return 0 (no tls_data, no ack, no stream data, no lost frames)" }
         return 0
       end
@@ -970,9 +999,9 @@ module QUIC
       end
 
       unless @pending_path_challenges.empty?
-        @pending_path_challenges.each do |data|
+        @pending_path_challenges.each do |data, pid|
           packet.frames << PathChallengeFrame.new(data)
-          @outstanding_path_challenges.add(data.hexstring)
+          @outstanding_path_challenges[data.hexstring] = pid
         end
         @pending_path_challenges.clear
       end
@@ -1043,7 +1072,9 @@ module QUIC
       end
       
       # ENFORCE CONGESTION CONTROL
-      if (space == @space_app || space == @space_zero_rtt) && @recovery.can_send?
+      # Skip stream/flow-control frames when sending a 1-RTT CRYPTO frame (NST) to
+      # avoid exceeding the path MTU (CRYPTO frame + stream data > MTU).
+      if (space == @space_app || space == @space_zero_rtt) && @recovery.can_send? && tls_data.nil?
         # Aggiungiamo i frame di Flow Control se pendenti
         if @pending_max_data
           packet.frames << MaxDataFrame.new(@max_data_local)
@@ -1070,6 +1101,16 @@ module QUIC
         if @pending_max_streams_bidi > 0
           packet.frames << MaxStreamsFrame.new(@pending_max_streams_bidi, true)
           @pending_max_streams_bidi = 0_u64
+        end
+
+        # RFC 9000 §4.6: STREAMS_BLOCKED — notify the peer we're at the stream limit.
+        if @pending_streams_blocked_bidi > 0
+          packet.frames << StreamsBlockedFrame.new(@pending_streams_blocked_bidi, true)
+          @pending_streams_blocked_bidi = 0_u64
+        end
+        if @pending_streams_blocked_uni > 0
+          packet.frames << StreamsBlockedFrame.new(@pending_streams_blocked_uni, false)
+          @pending_streams_blocked_uni = 0_u64
         end
 
         # HANDSHAKE_DONE: server tells client the handshake is confirmed, then
@@ -1264,6 +1305,21 @@ module QUIC
       check_and_apply_remote_tp
       stream = @streams[stream_id] ||= begin
         max_remote, max_local = initial_stream_limits(stream_id)
+        # RFC 9000 §4.6: queue STREAMS_BLOCKED when a locally-initiated new stream
+        # would exceed the peer's MAX_STREAMS grant.
+        local_initiated = (stream_id % 2 == 1) == @is_server
+        if local_initiated
+          ordinal = stream_id / 4
+          if (stream_id % 4) < 2
+            if @max_streams_bidi_remote > 0 && ordinal >= @max_streams_bidi_remote
+              @pending_streams_blocked_bidi = @max_streams_bidi_remote
+            end
+          else
+            if @max_streams_uni_remote > 0 && ordinal >= @max_streams_uni_remote
+              @pending_streams_blocked_uni = @max_streams_uni_remote
+            end
+          end
+        end
         Stream.new(stream_id, max_remote, max_local)
       end
       stream.write(data)
@@ -1276,6 +1332,15 @@ module QUIC
 
     def send_datagram(data : Bytes)
       @queued_datagrams << data
+    end
+
+    # RFC 9000 §4.6: signal to the peer that we are blocked waiting for more streams.
+    def queue_streams_blocked(bidi : Bool, limit : UInt64)
+      if bidi
+        @pending_streams_blocked_bidi = limit
+      else
+        @pending_streams_blocked_uni = limit
+      end
     end
 
     def probe_path_mtu(size : UInt64)
@@ -1562,7 +1627,7 @@ module QUIC
             @tls.set_remote_tp(tp)
             Log.trace { "Successfully parsed remote transport parameters from crypto stream!" }
           rescue ex
-            Log.trace { "Error decoding transport parameters from crypto stream: #{ex.message}" }
+            Log.warn { "Failed to decode transport parameters from crypto stream: #{ex.message}" }
           end
         end
       end

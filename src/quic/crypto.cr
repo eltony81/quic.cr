@@ -69,9 +69,23 @@ module QUIC
       # Safe because QUIC send/recv runs in a single fiber at a time.
       @nonce : Bytes
       @algorithm : String
+      # Cached cipher contexts — allocated once per AEAD instance, reused on
+      # every packet. Eliminates 2× EVP_CIPHER_CTX_new() per packet on the
+      # hot path (1 for decrypt, 1 for encrypt_into).
+      @cipher_enc : OpenSSL::Cipher
+      @cipher_dec : OpenSSL::Cipher
+      # Pre-allocated plaintext buffer for decrypt. Frame.decode copies stream
+      # data out of the slice before the next decrypt call overwrites it, so
+      # returning @decrypt_buf[0, n] without .dup is safe.
+      DECRYPT_BUF_SIZE = 4096
+      @decrypt_buf : Bytes
 
       def initialize(@key, @iv, @algorithm = "AES-128-GCM")
         @nonce = @iv.dup
+        name = openssl_cipher_name
+        @cipher_enc = OpenSSL::Cipher.new(name)
+        @cipher_dec = OpenSSL::Cipher.new(name)
+        @decrypt_buf = Bytes.new(DECRYPT_BUF_SIZE)
       end
 
       private def openssl_cipher_name : String
@@ -82,40 +96,39 @@ module QUIC
         end
       end
 
-      # Encrypts plaintext and returns ciphertext + 16-byte GCM tag in a single
-      # pre-allocated buffer (1 alloc instead of 4+ intermediate concatenations).
+      # Encrypts plaintext and returns ciphertext + 16-byte GCM tag.
+      # Uses cached cipher context — no EVP_CIPHER_CTX_new() on hot path.
       def encrypt(ad : Bytes, pn : UInt64, plaintext : Bytes) : Bytes
         build_nonce(pn)
-        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
-        cipher.encrypt
-        cipher.key = @key
-        cipher.iv = @nonce
-        cipher.update_ad(ad)
-
+        @cipher_enc.encrypt
+        @cipher_enc.key = @key
+        @cipher_enc.iv  = @nonce
+        @cipher_enc.update_ad(ad)
         result = Bytes.new(plaintext.size + 16)
-        n = cipher.update_into(plaintext, result)
-        cipher.final  # AEAD finalization — produces no extra bytes
-        cipher.gcm_get_tag_into(result, n)
+        n = @cipher_enc.update_into(plaintext, result)
+        @cipher_enc.final
+        @cipher_enc.gcm_get_tag_into(result, n)
         result
       end
 
-      # Encrypts plaintext directly into `out[0, plaintext.size+16]` — zero heap
-      # allocations. Returns total bytes written (plaintext.size + 16 tag).
+      # Encrypts plaintext directly into `dst[0, plaintext.size+16]`.
+      # Zero heap allocations on the hot path — uses cached cipher context.
       def encrypt_into(ad : Bytes, pn : UInt64, plaintext : Bytes, dst : Bytes) : Int32
         build_nonce(pn)
-        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
-        cipher.encrypt
-        cipher.key = @key
-        cipher.iv  = @nonce
-        cipher.update_ad(ad)
-        n = cipher.update_into(plaintext, dst)
-        cipher.final
-        cipher.gcm_get_tag_into(dst, n)
+        @cipher_enc.encrypt
+        @cipher_enc.key = @key
+        @cipher_enc.iv  = @nonce
+        @cipher_enc.update_ad(ad)
+        n = @cipher_enc.update_into(plaintext, dst)
+        @cipher_enc.final
+        @cipher_enc.gcm_get_tag_into(dst, n)
         n + 16
       end
 
-      # Decrypts ciphertext (last 16 bytes = tag) into a single pre-allocated
-      # plaintext buffer.
+      # Decrypts ciphertext (last 16 bytes = GCM tag) and returns plaintext.
+      # Uses cached cipher context and pre-allocated @decrypt_buf — zero heap
+      # allocations for typical QUIC packet sizes (≤ DECRYPT_BUF_SIZE bytes).
+      # Falls back to a fresh allocation only for oversized packets.
       def decrypt(ad : Bytes, pn : UInt64, ciphertext : Bytes) : Bytes
         tag_size = 16
         raise Error.new("Ciphertext too short") if ciphertext.size < tag_size
@@ -124,17 +137,22 @@ module QUIC
         actual_ct = ciphertext[0, ciphertext.size - tag_size]
         tag       = ciphertext[ciphertext.size - tag_size, tag_size]
 
-        cipher = OpenSSL::Cipher.new(openssl_cipher_name)
-        cipher.decrypt
-        cipher.key = @key
-        cipher.iv = @nonce
-        cipher.update_ad(ad)
-        cipher.gcm_set_tag(tag)
+        @cipher_dec.decrypt
+        @cipher_dec.key = @key
+        @cipher_dec.iv  = @nonce
+        @cipher_dec.update_ad(ad)
+        @cipher_dec.gcm_set_tag(tag)
 
-        result = Bytes.new(actual_ct.size)
-        n = cipher.update_into(actual_ct, result)
-        cipher.final
-        result[0, n]
+        if actual_ct.size <= DECRYPT_BUF_SIZE
+          n = @cipher_dec.update_into(actual_ct, @decrypt_buf)
+          @cipher_dec.final
+          @decrypt_buf[0, n]
+        else
+          result = Bytes.new(actual_ct.size)
+          n = @cipher_dec.update_into(actual_ct, result)
+          @cipher_dec.final
+          result[0, n]
+        end
       rescue e : OpenSSL::Cipher::Error
         raise InternalError.new("Decryption failed: #{e.message}")
       end
@@ -247,8 +265,24 @@ module QUIC
     class HeaderProtection
       @key : Bytes
       @algorithm : String
+      # Cached cipher context — allocated once, reused on every packet.
+      # Eliminates 2× OpenSSL::Cipher.new per packet (hp_rx + hp_tx).
+      @cipher : OpenSSL::Cipher
+      # Pre-allocated output buffer. apply!() reads it immediately after mask()
+      # returns on the same fiber, so returning @mask_buf as a slice is safe.
+      @mask_buf : Bytes
+      # Zero-byte input for chacha20 header protection (RFC 9001 §5.4.4).
+      @chacha_input : Bytes
 
       def initialize(@key, @algorithm = "AES-128-ECB")
+        name = case @algorithm
+               when "CHACHA20"    then "chacha20"
+               when "AES-256-ECB" then "AES-256-ECB"
+               else "AES-128-ECB"
+               end
+        @cipher = OpenSSL::Cipher.new(name)
+        @mask_buf = Bytes.new(16)
+        @chacha_input = Bytes.new(5, 0_u8)
       end
 
       def mask(sample : Bytes) : Bytes
@@ -256,25 +290,26 @@ module QUIC
         when "CHACHA20"
           # RFC 9001 §5.4.4: counter = LE32(sample[0:4]), nonce = sample[4:16].
           # OpenSSL chacha20 IV = [counter_le32 | nonce_96bit] = sample[0:16].
-          cipher = OpenSSL::Cipher.new("chacha20")
-          cipher.encrypt
-          cipher.key = @key
-          cipher.iv = sample
-          cipher.update(Bytes.new(5, 0_u8))
+          @cipher.encrypt
+          @cipher.key = @key
+          @cipher.iv = sample
+          @cipher.update_into(@chacha_input, @mask_buf)
+          # No final() for chacha20 — stream cipher, no block padding to flush.
+          @mask_buf
         when "AES-256-ECB"
-          cipher = OpenSSL::Cipher.new("AES-256-ECB")
-          cipher.encrypt
-          cipher.key = @key
-          cipher.padding = false
-          mask = cipher.update(sample)
-          mask + cipher.final
+          @cipher.encrypt
+          @cipher.key = @key
+          @cipher.padding = false
+          @cipher.update_into(sample, @mask_buf)
+          @cipher.final
+          @mask_buf
         else
-          cipher = OpenSSL::Cipher.new("AES-128-ECB")
-          cipher.encrypt
-          cipher.key = @key
-          cipher.padding = false
-          mask = cipher.update(sample)
-          mask + cipher.final
+          @cipher.encrypt
+          @cipher.key = @key
+          @cipher.padding = false
+          @cipher.update_into(sample, @mask_buf)
+          @cipher.final
+          @mask_buf
         end
       end
 

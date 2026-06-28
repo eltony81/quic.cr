@@ -177,6 +177,109 @@ python examples/benchmark_concurrent.py --port 4433 --conns 8 --reps 3
 
 ---
 
+## Go vs Crystal HTTP/3 benchmark
+
+`bench/go_client/bench_h3/` is a standalone Go program that starts an inline
+**quic-go HTTP/3 server** on port 4444, then runs identical workloads against
+both servers and prints a side-by-side comparison.
+
+### Prerequisites
+
+```bash
+# Go ≥ 1.23 required
+go version
+
+# Build the Crystal server — --release is required for accurate numbers
+crystal build examples/e2e_server.cr -o /tmp/e2e_server --release
+
+# Optional: multi-threaded build (gains on multi-connection workloads)
+crystal build examples/e2e_server.cr -o /tmp/e2e_server_mt --release -Dpreview_mt
+```
+
+### Steps
+
+```bash
+# 1. Start the Crystal server (keep this terminal open)
+/tmp/e2e_server
+# or for multi-thread: CRYSTAL_WORKERS=4 /tmp/e2e_server_mt
+
+# 2. In another terminal — build and run the benchmark
+cd bench/go_client/bench_h3
+go build -o bench_h3 .
+./bench_h3
+```
+
+The Go server is started **inline** by the benchmark — no separate process needed.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-crystal-port` | 4433 | Crystal server port |
+| `-go-port` | 4444 | Go server port (started inline) |
+| `-seq-n` | 300 | Sequential requests for latency test |
+| `-conc-n` | 1000 | Total requests for concurrent RPS test |
+| `-conc-c` | 50 | Worker concurrency for RPS test |
+| `-tp-n` | 20 | Requests for throughput test (100 kB each) |
+
+Example with higher load:
+
+```bash
+./bench_h3 -seq-n 1000 -conc-n 5000 -conc-c 100
+```
+
+### What it measures
+
+| Scenario | Endpoint | Metric |
+|----------|----------|--------|
+| Sequential latency | `GET /ping` | avg / p50 / p99 |
+| Concurrent throughput | `GET /ping` | req/s, p99 latency |
+| Bandwidth | `GET /100k` | MB/s |
+
+### Sample output
+
+Build the Crystal server with `--release` before running (see steps above).
+
+```
+Crystal server OK on :4433
+Go server started on :4444
+Config: seq=300  conc=1000/50 workers  tp=20×100k
+Warming up.. done
+
+Benchmarking Crystal quic.cr…
+Benchmarking Go quic-go…
+
+┌────────────────────────────────────────────────────────────────┐
+│         HTTP/3 Benchmark: Crystal quic.cr vs Go quic-go        │
+├──────────────────────────────┬──────────────────┬──────────────┤
+│  Metric                      │  Crystal quic.cr │  Go quic-go  │
+├──────────────────────────────┼──────────────────┼──────────────┤
+│  Sequential latency (GET /ping)                               │
+      avg                         531µs            150µs
+      p50                         152µs            126µs
+      p99                         881µs            767µs
+│                                                               │
+│  Concurrent (GET /ping)                                       │
+      req/s                   14697 req/s       27616 req/s
+      p99 latency               6.3ms             4.3ms
+│                                                               │
+│  Throughput (GET /100k)                                       │
+      MB/s                     42.5 MB/s        203.9 MB/s
+├──────────────────────────────────────────────────────────────┤
+  RPS Crystal/Go:        0.53x
+  Throughput Crystal/Go: 0.21x
+└──────────────────────────────────────────────────────────────┘
+```
+
+> quic-go is ~1.9× faster on RPS and ~4.8× faster on bulk throughput. The gap
+> is expected: quic-go uses native goroutines with a concurrent GC and
+> assembly-optimised send paths; quic.cr is a pure-Crystal implementation with
+> Boehm GC and a single actor per connection. UDP GRO (Generic Receive Offload)
+> is now active: the receiver batches multiple QUIC datagrams per recvmmsg slot,
+> improving throughput by +17% vs the previous build.
+
+---
+
 ## RFC / IETF compliance
 
 The following standards are implemented.  Partial support is noted inline.

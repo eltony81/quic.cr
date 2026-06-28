@@ -122,7 +122,7 @@ module QUIC
           @connections.delete(conn_key) if conn.closed?
           
         rescue e
-          Log.trace { "Server error: #{e.message}" }
+          Log.warn { "Server receive loop: #{e.class} from #{client_addr rescue "unknown"} — #{e.message}" }
         end
       end
     end

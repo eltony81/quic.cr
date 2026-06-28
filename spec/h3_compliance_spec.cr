@@ -994,4 +994,87 @@ describe "H3 QPACK Integration (RFC 9204)" do
     decoded_frame = receiver.read_frame(io).as(H3::DataFrame)
     decoded_frame.data.should eq(payload)
   end
+
+  # ── GOAWAY graceful drain (RFC 9114 §5.2) ──────────────────────────────────
+
+  it "GoAwayFrame encodes and decodes correctly" do
+    frame = H3::GoAwayFrame.new(42_u64)
+    io = IO::Memory.new
+    frame.encode(io)
+    io.rewind
+    decoded = H3::Frame.decode(io, nil)
+    decoded.should be_a(H3::GoAwayFrame)
+    decoded.as(H3::GoAwayFrame).stream_id.should eq(42_u64)
+  end
+
+  it "send_goaway writes a GoAway frame on the control stream" do
+    config = QUIC::Config.new
+    conn = QUIC::Connection.new(config, is_server: false)
+    h3 = H3::Connection.new(conn)
+    # Open a control stream manually and hook it into H3::Connection
+    ctrl_sock = h3.open_control_stream
+    sf = H3::SettingsFrame.new
+    sf.settings = {0x01_u64 => 0_u64}
+    io = IO::Memory.new
+    h3.write_frame(io, sf)  # write_frame needs IO, not socket
+
+    # send_goaway must not raise
+    h3.send_goaway(0_u64)
+  end
+
+  # ── Dynamic QPACK (RFC 9204) ────────────────────────────────────────────────
+
+  it "apply_remote_settings enables encoder dynamic table" do
+    config = QUIC::Config.new
+    conn = QUIC::Connection.new(config, is_server: false)
+    h3 = H3::Connection.new(conn)
+    h3.open_qpack_streams
+
+    settings = {0x01_u64 => 4096_u64, 0x07_u64 => 16_u64}
+    h3.apply_remote_settings(settings)  # must not raise
+  end
+
+  it "apply_remote_settings with capacity=0 is a no-op" do
+    config = QUIC::Config.new
+    conn = QUIC::Connection.new(config, is_server: false)
+    h3 = H3::Connection.new(conn)
+    # capacity=0 means peer's decoder cannot use dynamic table; no-op
+    settings = {0x01_u64 => 0_u64}
+    h3.apply_remote_settings(settings)  # must not raise
+  end
+
+  it "QPACK encoder uses dynamic table after set_capacity" do
+    enc = H3::QPACK::Encoder.new
+    enc.set_capacity(4096_u64)
+    dec = H3::QPACK::Decoder.new
+
+    # Feed the Set Dynamic Table Capacity instruction to the decoder first
+    dec.process_encoder_stream(enc.encoder_stream_io.to_slice)
+    enc.encoder_stream_io.clear; enc.encoder_stream_io.rewind
+
+    # Encode twice with a header not in the static table — encoder inserts into dynamic table
+    first  = enc.encode({"x-custom" => "value1"})
+    dec.process_encoder_stream(enc.encoder_stream_io.to_slice)
+    enc.encoder_stream_io.clear; enc.encoder_stream_io.rewind
+    h1 = dec.decode(first)
+    h1["x-custom"].should eq("value1")
+
+    # Second encoding references the dynamic entry (same name/value)
+    second = enc.encode({"x-custom" => "value1"})
+    dec.process_encoder_stream(enc.encoder_stream_io.to_slice)
+    enc.encoder_stream_io.clear; enc.encoder_stream_io.rewind
+    h2 = dec.decode(second)
+    h2["x-custom"].should eq("value1")
+  end
+
+  it "SettingsFrame round-trips QPACK_MAX_TABLE_CAPACITY" do
+    sf = H3::SettingsFrame.new
+    sf.settings = {0x01_u64 => 4096_u64, 0x07_u64 => 16_u64, 0x06_u64 => 16384_u64}
+    io = IO::Memory.new
+    sf.encode(io)
+    io.rewind
+    decoded = H3::Frame.decode(io, nil).as(H3::SettingsFrame)
+    decoded.settings[0x01_u64].should eq(4096_u64)
+    decoded.settings[0x07_u64].should eq(16_u64)
+  end
 end

@@ -70,38 +70,34 @@ module H3
       LibC.setsockopt(udp.fd, LibSys::IPPROTO_IP, LibSys::IP_TOS, pointerof(tos).as(Void*), sizeof(Int32).to_u32)
       @udp_socket = udp
       batch_receiver = QUIC::BatchReceiver.new(udp)
-      # GRO merges multiple short-header QUIC packets into one recv() buffer.
-      # Short headers have no Length field, so merged segments can't be split
-      # without the UDP_GRO cmsg.  Leave GRO disabled until cmsg handling is added.
-      # batch_receiver.enable_gro!(udp)
+      # GRO merges equal-size QUIC packets into one large buffer per recvmmsg slot.
+      # blocking_drain reads the UDP_GRO cmsg to learn gso_size and each_segment
+      # splits the buffer correctly. On loopback (Linux 6.1) the kernel accepts
+      # UDP_GRO but does not coalesce, so each_segment falls back to single-packet
+      # mode transparently when msg_controllen=0.
+      batch_receiver.enable_gro!(udp)
       Log.info { "🚀 HTTP/3 Server listening on udp://#{host}:#{port}" }
 
       # Router-only state — never touched by actor fibers (no mutex needed).
       connections = {} of String => ConnectionActor
-      buf_pool    = QUIC::BufferPool.new
 
       # Single RouterMsg channel avoids Crystal's select union-type merging.
       # Struct wrappers give the case/when branches distinct types to narrow on.
       router_chan = Channel(RouterMsg).new(4096 + 512)
 
-      # Receiver fiber: block on first datagram via epoll, then drain the queue.
+      # Receiver fiber: blocking_drain waits via IO.select (fiber-aware epoll),
+      # then drains all buffered packets with recvmmsg MSG_DONTWAIT. With GRO,
+      # each slot may hold N coalesced packets; each_segment splits them by gso_size.
       spawn do
         loop do
-          buf = buf_pool.lease
           begin
-            size, client_addr = udp.receive(buf)
-            packet_data = buf[0, size].dup
-            buf_pool.return(buf)
-            router_chan.send(RouterPacket.new(packet_data, client_addr))
-
-            n = batch_receiver.drain_nowait
+            n = batch_receiver.blocking_drain(udp)
             n.times do |i|
-              data, addr = batch_receiver.packet(i)
-              next if data.empty?
-              router_chan.send(RouterPacket.new(data, addr))
+              batch_receiver.each_segment(i) do |data, addr|
+                router_chan.send(RouterPacket.new(data, addr))
+              end
             end
           rescue e
-            buf_pool.return(buf)
             break if udp.closed?
             Log.debug { "recv error: #{e.message}" }
           end
@@ -184,7 +180,8 @@ module H3
       rescue e : QPACK::ValidationError
         h3_conn.quic.close(H3::ErrorCode::H3_MESSAGE_ERROR, e.message || "header validation error")
         return
-      rescue
+      rescue e
+        Log.debug { "H3 request: failed to read first frame: #{e.class} — #{e.message}" }
         return
       end
 
@@ -232,7 +229,8 @@ module H3
           else
             break
           end
-        rescue
+        rescue e
+          Log.debug { "H3 request: body frame read interrupted: #{e.message}" }
           break
         end
       end
@@ -243,9 +241,16 @@ module H3
         request  = H3::Request.new(req_frame.headers, body, remote_address)
         response = H3::Response.new
         ctx      = H3::Context.new(request, response)
+        ctx.h3_conn = h3_conn
+        ctx.request_stream_id = stream.responds_to?(:stream_id) ? stream.stream_id : nil
 
-        unless router.dispatch(ctx)
-          ctx.not_found
+        begin
+          unless router.dispatch(ctx)
+            ctx.not_found
+          end
+        rescue e
+          Log.error(exception: e) { "Handler exception — #{request.method} #{request.path}" }
+          ctx.response.text("Internal Server Error", 500)
         end
 
         h3_conn.write_frame(stream, HeadersFrame.new(response.to_h3_headers))
@@ -254,9 +259,15 @@ module H3
 
       elsif handler = @low_level_handler
         # ---- Mode 1: Low-level block handler (backwards-compatible) ---------
-        resp_headers, resp_body = handler.call(req_frame.headers, body)
-        h3_conn.write_frame(stream, HeadersFrame.new(resp_headers))
-        h3_conn.write_frame(stream, DataFrame.new(resp_body)) unless resp_body.empty?
+        begin
+          resp_headers, resp_body = handler.call(req_frame.headers, body)
+          h3_conn.write_frame(stream, HeadersFrame.new(resp_headers))
+          h3_conn.write_frame(stream, DataFrame.new(resp_body)) unless resp_body.empty?
+        rescue e
+          Log.error(exception: e) { "Low-level handler exception" }
+          error_resp = {":status" => "500"}
+          h3_conn.write_frame(stream, HeadersFrame.new(error_resp))
+        end
       end
 
       if stream.responds_to?(:close_local)
@@ -284,10 +295,18 @@ module H3
           begin
             frame = H3::Frame.decode(stream, nil)
             case frame
+            when H3::SettingsFrame
+              # Apply peer's QPACK_MAX_TABLE_CAPACITY to our encoder (RFC 9204 §3.2).
+              h3_conn.apply_remote_settings(frame.settings)
             when H3::GoAwayFrame
               h3_conn.peer_goaway_stream_id = frame.stream_id
+            when H3::MaxPushIdFrame
+              # Track the highest push ID the client will accept (RFC 9114 §4.6).
+              cur = h3_conn.peer_max_push_id
+              h3_conn.peer_max_push_id = cur ? Math.max(cur, frame.push_id) : frame.push_id
             end
-          rescue
+          rescue e
+            Log.debug { "Control stream decode stopped: #{e.message}" }
             break
           end
         end
@@ -321,7 +340,8 @@ module H3
         io.read_fully(dcid)
         dcid.hexstring
       end
-    rescue
+    rescue e
+      Log.debug { "extract_dcid failed: #{e.message}" }
       "unknown"
     end
   end

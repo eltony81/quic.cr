@@ -59,7 +59,7 @@ module QUIC
     this.set_remote_tp(tp)
     1
   rescue ex
-    Log.trace { "TLS Callback: got_transport_params_cb error: #{ex.message}" }
+    Log.warn { "TLS: failed to decode remote transport parameters: #{ex.message}" }
     0
   end
 
@@ -84,10 +84,10 @@ module QUIC
         end
         i += 1 + len
       end
-      Log.trace { "  ALPN selection failed, returning no match" }
+      Log.warn { "TLS: no h3 ALPN offered by peer (inlen=#{inlen})" }
       3
     rescue ex
-      Log.trace { "TLS Callback: alpn_select_cb raised exception: #{ex.message}" }
+      Log.warn { "TLS: alpn_select_cb exception: #{ex.message}" }
       3
     end
   end
@@ -235,6 +235,9 @@ module QUIC
       end
 
       if @is_server
+        # Enable 0-RTT early data in the NST sent to clients (RFC 9001 §4.6.1).
+        # Must be called before SSL_set_accept_state; max_early_data becomes 0xffffffff after that call.
+        LibSSL.SSL_set_quic_tls_early_data_enabled(@ssl, 1)
         LibSSL.SSL_set_accept_state(@ssl)
       else
         LibSSL.ssl_set_verify(@ssl, 0, nil) # 0 = SSL_VERIFY_NONE
@@ -417,6 +420,8 @@ lib LibSSL
 
   # 0-RTT / Early Data
   fun SSL_CTX_set_max_early_data(ctx : SSLContext, max_early_data : UInt32) : Int32
+  # For SSL_set_quic_tls_cbs mode: enables 0-RTT early data in the NST (RFC 9001 §4.6.1).
+  fun SSL_set_quic_tls_early_data_enabled(ssl : SSL, enabled : Int32) : Int32
 
   # SSL_CTX_set_session_cache_mode is a macro in OpenSSL 3 — use ssl_ctx_ctrl directly
   SSL_CTRL_SET_SESS_CACHE_MODE = 44

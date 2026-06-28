@@ -1,5 +1,6 @@
 require "socket"
 require "../quic/batch_sender"
+require "./response_ring"
 
 module H3
   # Tagged message structs for the router event channel.
@@ -16,8 +17,7 @@ module H3
   class ConnectionActor
     Log = ::Log.for("H3::ConnectionActor")
 
-    getter packet_chan   : Channel(Bytes)
-    getter response_chan : Channel({UInt64, Bytes})
+    getter packet_chan : Channel(Bytes)
 
     @quic_conn    : QUIC::Connection
     @h3_conn      : H3::Connection
@@ -34,6 +34,11 @@ module H3
     @out_buf          : Bytes
     @fwd_buf          : Bytes
     @batch_sender     : QUIC::BatchSender
+    @goaway_pending   : Bool = false
+    @response_ring    : ResponseRing
+    # Single-element wake channel: handler fibers do a non-blocking send after
+    # pushing to response_ring so the actor's select unblocks promptly.
+    @wake_chan        : Channel(Nil)
     # Pacing token bucket: tokens represent bytes we are allowed to send right now.
     # Starts unlimited so the handshake and initial burst are never throttled.
     @pacing_tokens    : Float64 = Float64::MAX
@@ -43,8 +48,9 @@ module H3
       @quic_conn, @h3_conn, @peer_addr, @udp, @server,
       @router_chan, @initial_key
     )
-      @packet_chan   = Channel(Bytes).new(512)
-      @response_chan = Channel({UInt64, Bytes}).new(256)
+      @packet_chan    = Channel(Bytes).new(512)
+      @response_ring = ResponseRing.new
+      @wake_chan     = Channel(Nil).new(1)
       @out_buf = Bytes.new(65536)
       @fwd_buf = Bytes.new(65536)
       @batch_sender = QUIC::BatchSender.new(@udp)
@@ -60,7 +66,7 @@ module H3
     end
 
     def shutdown
-      @quic_conn.close(0_u64, "server shutdown")
+      @goaway_pending = true
       select
       when @packet_chan.send(Bytes.empty)
       else
@@ -88,13 +94,18 @@ module H3
           # the whole packet batch — reduces channel sends from O(packets) to
           # O(MB / 64KB) ≈ 16 sends for 1MB instead of ~680.
           forward_stream_data
+          # Send ACKs / stream data immediately before yielding — keeps the
+          # congestion-control feedback loop tight for throughput.
           flush_outgoing
           # Yield so handler fibers (waiting on data_chan) can run promptly.
-          # Without this, a busy actor processing rapid ACKs starves handlers.
           Fiber.yield
+          # Pick up responses that handler fibers pushed during the yield.
+          drain_responses
 
-        when resp = @response_chan.receive
-          handle_response(resp[0], resp[1])
+        when @wake_chan.receive
+          # A handler fiber pushed a response to response_ring and sent this
+          # wake signal so we don't stay blocked in select until the next packet.
+          drain_responses
 
         when timeout(next_tick_timeout)
           @quic_conn.tick
@@ -103,7 +114,7 @@ module H3
         break if @quic_conn.closed?
       end
     rescue e
-      Log.error { "Actor #{@initial_key[0, 8]} crashed: #{e.class} — #{e.message}" }
+      Log.error(exception: e) { "Actor #{@initial_key[0, 8]} crashed: #{e.class}" }
     ensure
       @stream_channels.each_value do |ch|
         select
@@ -118,6 +129,18 @@ module H3
     end
 
     private def recv_packet(data : Bytes)
+      if data.empty?
+        if @goaway_pending
+          # RFC 9114 §5.2 graceful drain: send GOAWAY before closing so the peer
+          # can retry requests with IDs above the last-processed stream.
+          last_bidi = @handled_streams.select { |sid| sid % 4 == 0 }.max? || 0_u64
+          @h3_conn.send_goaway(last_bidi)
+          flush_outgoing
+          @quic_conn.close(0_u64, "server shutdown")
+          @goaway_pending = false
+        end
+        return
+      end
       was_completed = @quic_conn.handshake_complete?
       @quic_conn.recv(data)
 
@@ -136,6 +159,36 @@ module H3
       end
 
       dispatch_new_streams
+    end
+
+    # Called by external fibers to submit a completed response without blocking.
+    # Pushes to the lock-free ring buffer and sends a non-blocking wake signal.
+    def push_response(stream_id : UInt64, data : Bytes)
+      unless @response_ring.push(stream_id, data)
+        Log.warn { "Actor #{@initial_key[0, 8]}: response_ring full, dropping response for stream #{stream_id}" }
+      end
+      # Non-blocking: capacity-1 channel; if already signalled the actor will
+      # still drain the ring on its next wake.
+      select
+      when @wake_chan.send(nil)
+      else
+      end
+    end
+
+    # Drain all pending responses from the ring buffer and flush once.
+    # Batching all stream writes before flushing lets the send path pack
+    # multiple stream frames into fewer packets.
+    private def drain_responses
+      found = false
+      while entry = @response_ring.pop
+        stream_id, data = entry
+        if stream = @quic_conn.streams[stream_id]?
+          stream.write(data)
+          stream.close_local
+        end
+        found = true
+      end
+      flush_outgoing if found
     end
 
     private def handle_response(stream_id : UInt64, data : Bytes)
@@ -218,28 +271,38 @@ module H3
       max_burst = rate * 0.050
       @pacing_tokens = (@pacing_tokens + rate * elapsed).clamp(0.0, max_burst)
 
+      # Drain all ready packets into the batch sender, then flush once with
+      # sendmmsg — collapses N syscalls (one per packet) into 1-2 syscalls.
       loop do
         break if @pacing_tokens <= 0
         n = @quic_conn.send_coalesced(@out_buf)
         break if n == 0
-        @udp.send(@out_buf[0, n], @peer_addr)
+        @batch_sender.add(@out_buf[0, n], @peer_addr)
         @pacing_tokens -= n
       end
-    rescue
-
+      @batch_sender.flush
+    rescue e
+      Log.debug { "flush_outgoing error (peer=#{@peer_addr}): #{e.message}" }
     end
 
     private def init_h3_control_streams
       ctrl = @h3_conn.open_control_stream
       sf   = H3::SettingsFrame.new
-      # 0x01 = QPACK_MAX_TABLE_CAPACITY = 0 (disable dynamic QPACK; use static/literal only)
-      # 0x07 = QPACK_BLOCKED_STREAMS = 0, 0x06 = MAX_FIELD_SECTION_SIZE
-      sf.settings = {0x01_u64 => 0_u64, 0x07_u64 => 0_u64, 0x06_u64 => 16384_u64}
+      # 0x01 = QPACK_MAX_TABLE_CAPACITY: our decoder can handle up to 4096 bytes of dynamic table.
+      # 0x07 = QPACK_BLOCKED_STREAMS = 16 (allow up to 16 blocked streams while waiting for encoder stream)
+      # 0x06 = MAX_FIELD_SECTION_SIZE
+      sf.settings = {0x01_u64 => 4096_u64, 0x07_u64 => 16_u64, 0x06_u64 => 16384_u64}
       @h3_conn.write_frame(ctrl, sf)
       @h3_conn.open_qpack_streams
+      # Echo QUIC datagrams back to the sender (RFC 9221).
+      # The actor's run loop calls flush_outgoing after recv_packet, so the
+      # queued datagram is sent in the same batch as the ACK for the incoming packet.
+      @quic_conn.on_datagram = ->(data : Bytes) {
+        @quic_conn.send_datagram(data)
+      }
       flush_outgoing
     rescue e
-      Log.error { "H3 control stream init failed: #{e.message}" }
+      Log.error(exception: e) { "H3 control stream init failed: #{e.class} — #{e.message}" }
     end
   end
 end

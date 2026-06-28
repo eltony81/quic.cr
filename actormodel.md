@@ -1,104 +1,104 @@
 # Actor Model in quic.cr
 
-> **Lato server only.** Il pattern è adottato esclusivamente da `H3::Server.listen`
-> tramite `H3::ConnectionActor` (`src/h3/connection_actor.cr`, `src/h3/server.cr`).
-> `H3::Client` **non usa** l'actor model: gestisce la connessione direttamente nel
-> fiber chiamante con un `Channel(Bool)` per sincronizzare l'handshake e `spawn` per
-> il receive loop — un design più semplice adatto a una singola connessione outbound.
+> **Server-side only.** The pattern is used exclusively by `H3::Server.listen`
+> via `H3::ConnectionActor` (`src/h3/connection_actor.cr`, `src/h3/server.cr`).
+> `H3::Client` **does not use** the actor model: it manages the connection directly
+> in the calling fiber with a `Channel(Bool)` to synchronise the handshake and
+> `spawn` for the receive loop — a simpler design suited to a single outbound connection.
 
-Il server ha bisogno dell'actor model perché gestisce **N connessioni simultanee
-da peer diversi** su un singolo `UDPSocket`. Ogni connessione ha il suo stato QUIC
-indipendente (chiavi TLS, packet number spaces, stream, recovery) che non può essere
-condiviso tra fiber senza mutex. Assegnare un fiber dedicato per connessione elimina
-il problema alla radice: nessuna condivisione, nessun lock.
+The server needs the actor model because it handles **N simultaneous connections
+from different peers** on a single `UDPSocket`. Each connection has its own
+independent QUIC state (TLS keys, packet number spaces, streams, recovery) that
+cannot be shared between fibers without mutexes. Assigning a dedicated fiber per
+connection eliminates the problem at the root: no sharing, no locks.
 
-Ogni connessione QUIC ha un fiber dedicato (`ConnectionActor`) che possiede lo stato
-in esclusiva — comunicazione solo via `Channel`.
+Each QUIC connection has a dedicated fiber (`ConnectionActor`) that exclusively owns
+its state — communication only via `Channel`.
 
 ---
 
-## Panoramica dei componenti
+## Component overview
 
 ```mermaid
 graph TD
     NET(["UDP Network"])
     RF["Receiver Fiber\n1 per server\nUDPSocket.receive\nBatchReceiver.drain"]
     RL["Router Loop\n1 per server\nconnections : Hash\nsole owner of map"]
-    CA["ConnectionActor fiber\n1 per connessione\nQUIC::Connection\nH3::Connection\npacing token bucket"]
-    HF["Handler Fiber\n1 per stream bidi\nrouter/middleware\nctx.json / ctx.text"]
+    CA["ConnectionActor fiber\n1 per connection\nQUIC::Connection\nH3::Connection\npacing token bucket"]
+    HF["Handler Fiber\n1 per bidi stream\nrouter/middleware\nctx.json / ctx.text"]
 
-    NET -->|"datagram UDP"| RF
+    NET -->|"UDP datagram"| RF
     RF -->|"router_chan\nRouterPacket\ncap=4608"| RL
     RL -->|"actor.deliver()\npacket_chan\ncap=512"| CA
-    CA -->|"data_chan\nbyte HTTP\ncap=512"| HF
+    CA -->|"data_chan\nHTTP bytes\ncap=512"| HF
     HF -->|"response_chan\n{stream_id, bytes}\ncap=256"| CA
     CA -->|"RouterReg / RouterClean\nrouter_chan"| RL
-    CA -->|"udp.send()\npacchetto QUIC cifrato"| NET
+    CA -->|"udp.send()\nencrypted QUIC packet"| NET
 ```
 
 ---
 
-## Flusso completo — dal datagram UDP alla response HTTP
+## Full flow — from UDP datagram to HTTP response
 
-Questa sezione descrive passo per passo tutto quello che succede dall'arrivo
-di un datagram UDP fino all'invio della risposta HTTP/3 al client.
+This section describes step by step everything that happens from the arrival of a
+UDP datagram to sending the HTTP/3 response to the client.
 
-### 1. Receiver Fiber — ascoltare la rete
+### 1. Receiver Fiber — listening on the network
 
-Il `Receiver Fiber` è il solo punto di contatto con il socket UDP. Si blocca
-su `udp.receive(buf)`, che internamente usa `epoll` (Linux) e non consuma CPU
-in attesa. Quando arriva un datagram, il sistema operativo sveglia il fiber.
+The `Receiver Fiber` is the sole point of contact with the UDP socket. It blocks on
+`blocking_drain(udp)`, which internally uses `epoll` (Linux) and does not consume CPU
+while waiting. When a datagram arrives, the OS wakes the fiber.
 
-Dopo il primo datagram, viene chiamato `batch_receiver.drain_nowait` che usa
-`recvmmsg` (GRO — Generic Receive Offload) per leggere in un colpo solo tutti
-i datagram già presenti nel kernel receive buffer, senza ulteriori syscall.
-Ogni datagram viene copiato e inviato al `router_chan` come `RouterPacket`.
+`blocking_drain` calls `recvmmsg` with `MSG_DONTWAIT` to read in one shot all
+datagrams already present in the kernel receive buffer, without additional syscalls.
+With UDP GRO enabled, the kernel coalesces equal-size datagrams from the same source
+into one large buffer per slot; `each_segment` splits them by `gso_size`. Each
+datagram is copied and sent to `router_chan` as a `RouterPacket`.
 
-Il Receiver Fiber non sa nulla di QUIC — lavora solo con byte grezzi e
-indirizzi IP. Questo lo mantiene semplice e veloce.
+The Receiver Fiber knows nothing about QUIC — it works only with raw bytes and IP
+addresses. This keeps it simple and fast.
 
-### 2. Router Loop — smistare le connessioni
+### 2. Router Loop — routing connections
 
-Il Router Loop riceve i messaggi dal `router_chan` ed è il solo fiber che
-legge e scrive la mappa `connections : Hash(String, ConnectionActor)`.
-Non serve un mutex su questa mappa perché solo questo fiber la tocca.
+The Router Loop receives messages from `router_chan` and is the sole fiber that reads
+and writes the `connections : Hash(String, ConnectionActor)` map. No mutex is needed
+on this map because only this fiber touches it.
 
-Quando arriva un `RouterPacket`, il Router estrae il DCID (Destination
-Connection ID) dai primi byte del datagram QUIC e lo usa come chiave di
-lookup. Se non trova un actor per quel DCID, controlla se c'è un actor
-associato all'indirizzo IP sorgente (fallback per i pacchetti che arrivano
-prima della registrazione del SCID).
+When a `RouterPacket` arrives, the Router extracts the DCID (Destination Connection
+ID) from the first bytes of the QUIC datagram and uses it as a lookup key. If no
+actor is found for that DCID, it checks whether there is an actor associated with the
+source IP address (fallback for packets that arrive before the SCID is registered).
 
-Se non esiste nessun actor per questa connessione, il Router crea:
-- un `QUIC::Connection` con la configurazione TLS
-- un `H3::Connection` che mappa gli stream QUIC in semantica HTTP/3
-- un `ConnectionActor` che lancia il fiber e parte
+If no actor exists for this connection, the Router creates:
+- a `QUIC::Connection` with the TLS configuration
+- an `H3::Connection` that maps QUIC streams to HTTP/3 semantics
+- a `ConnectionActor` that spawns the fiber and starts running
 
-Il Router poi chiama `actor.deliver(data)`, che è una send non-bloccante
-sul `packet_chan` dell'actor. Se il canale fosse pieno (oltre 512 slot),
-il datagram verrebbe scartato silenziosamente — UDP è unreliable per design
-e QUIC gestisce la ritrasmissione a livello applicativo.
+The Router then calls `actor.deliver(data)`, a non-blocking send on the actor's
+`packet_chan`. If the channel were full (beyond 512 slots), the datagram would be
+silently dropped — UDP is unreliable by design and QUIC handles retransmission at
+the application level.
 
-Il Router gestisce anche due messaggi di controllo dall'actor:
-- `RouterReg`: l'actor ha completato l'handshake e conosce il suo SCID
-  definitivo — il Router aggiunge il nuovo alias alla mappa per lookup futuro.
-- `RouterClean`: l'actor si è chiuso — il Router rimuove tutte le entry.
+The Router also handles two control messages from the actor:
+- `RouterReg`: the actor has completed the handshake and knows its definitive SCID —
+  the Router adds the new alias to the map for future lookups.
+- `RouterClean`: the actor has closed — the Router removes all entries.
 
-### 3. ConnectionActor — il cuore della connessione
+### 3. ConnectionActor — the heart of the connection
 
-L'actor è un singolo fiber Crystal che gira in un loop `select` con tre
-braccia. Possiede in esclusiva `QUIC::Connection` e `H3::Connection` —
-nessun altro fiber li tocca mai.
+The actor is a single Crystal fiber running in a `select` loop with three arms. It
+exclusively owns `QUIC::Connection` and `H3::Connection` — no other fiber ever
+touches them.
 
 ```mermaid
 flowchart TD
-    S([" select "]) --> A1["arm 1\npacket_chan.receive\ndatagram QUIC"]
-    S --> A2["arm 2\nresponse_chan.receive\nrisposta HTTP"]
+    S([" select "]) --> A1["arm 1\npacket_chan.receive\nQUIC datagram"]
+    S --> A2["arm 2\nresponse_chan.receive\nHTTP response"]
     S --> A3["arm 3\ntimeout(next_tick_timeout)\nloss detection / PTO"]
 
-    A1 --> D["recv_packet(data)\nQUIC::Connection.recv\ndecrypt + parse frame"]
-    D --> DR["drain loop\nsvuota packet_chan\nnon-bloccante"]
-    DR --> FW["forward_stream_data\nbyte → data_chan handler"]
+    A1 --> D["recv_packet(data)\nQUIC::Connection.recv\ndecrypt + parse frames"]
+    D --> DR["drain loop\nflush packet_chan\nnon-blocking"]
+    DR --> FW["forward_stream_data\nbytes → data_chan handler"]
     FW --> FO1["flush_outgoing\npacing → udp.send"]
 
     A2 --> HR["handle_response\nstream.write + close_local"]
@@ -112,31 +112,29 @@ flowchart TD
     CK -->|"yes"| END([" ensure cleanup "])
 ```
 
-**Arm 1 — pacchetto in arrivo**: Il datagram grezzo viene passato a
-`QUIC::Connection.recv`, che decifra l'header (header protection), decifra
-il payload (AEAD AES-128-GCM), e dispatcha i frame contenuti: `CRYPTO` per
-il TLS handshake, `STREAM` per i dati HTTP, `ACK` per l'aggiornamento del
-recovery, ecc.
+**Arm 1 — incoming packet**: The raw datagram is passed to `QUIC::Connection.recv`,
+which unmasks the header (header protection), decrypts the payload (AEAD AES-128-GCM),
+and dispatches the contained frames: `CRYPTO` for the TLS handshake, `STREAM` for
+HTTP data, `ACK` for recovery updates, etc.
 
-Dopo `recv_packet`, il drain loop svuota tutto il `packet_chan` con un
-`select+else` non-bloccante. Questo è critico per la performance: invece di
-fare un round-trip nel `select` per ogni pacchetto (700 volte per 1 MB),
-si accumulano tutti i byte nei buffer stream e poi si chiama `flush_outgoing`
-una volta sola.
+After `recv_packet`, the drain loop flushes all of `packet_chan` with a non-blocking
+`select+else`. This is critical for performance: instead of making a round-trip in
+`select` for every packet (700 times for 1 MB), all bytes are accumulated in the
+stream buffers and `flush_outgoing` is called just once.
 
-**Arm 2 — risposta HTTP**: Un handler fiber ha terminato di costruire la
-risposta e la invia su `response_chan`. L'actor scrive i byte sull'oggetto
-stream QUIC e chiama `close_local` per appendere il bit FIN.
+**Arm 2 — HTTP response**: A handler fiber has finished building the response and
+sends it on `response_chan`. The actor writes the bytes to the QUIC stream object
+and calls `close_local` to append the FIN bit.
 
-**Arm 3 — timer**: Scatta quando scade il timeout calcolato da
-`next_tick_timeout`. Chiama `quic_conn.tick` che valuta se il Loss Detection
-Timer è scaduto (dichiarare pacchetti persi) o se è scaduto il PTO (Probe
-Timeout, inviare un probe per verificare che la rete sia attiva).
+**Arm 3 — timer**: Fires when the timeout computed by `next_tick_timeout` expires.
+Calls `quic_conn.tick`, which evaluates whether the Loss Detection Timer has expired
+(declare packets lost) or whether the PTO (Probe Timeout) has expired (send a probe
+to verify the network is alive).
 
-### 4. Dispatch degli stream HTTP/3
+### 4. HTTP/3 stream dispatch
 
-Quando `recv_packet` vede uno stream con ID % 4 == 0 (stream bidirezionale
-client-initiated, RFC 9000 §2.1), lancia un nuovo handler fiber.
+When `recv_packet` sees a stream with ID % 4 == 0 (client-initiated bidirectional
+stream, RFC 9000 §2.1), it spawns a new handler fiber.
 
 ```mermaid
 sequenceDiagram
@@ -150,65 +148,65 @@ sequenceDiagram
     Actor->>Sck: sock = ActorStreamSocket.new(stream_id, data_chan, self)
     Actor->>HF: spawn { server.handle_request(h3_conn, sock) }
 
-    note over Actor,HF: Handler fiber legge header HTTP/3 via sock.read()
-    note over Actor,HF: che blocca su data_chan.receive
+    note over Actor,HF: Handler fiber reads HTTP/3 headers via sock.read()
+    note over Actor,HF: which blocks on data_chan.receive
 
     Actor->>SC: forward_stream_data: stream.read → data_chan.send
-    data_chan-->>HF: bytes ricevuti dal peer
+    data_chan-->>HF: bytes received from peer
     HF->>HF: router/middleware dispatch
     HF->>Actor: response_chan.send({stream_id, bytes})
     Actor->>Actor: handle_response: stream.write + close_local
     Actor->>Actor: flush_outgoing → udp.send(STREAM frame + FIN)
 ```
 
-`ActorStreamSocket` è un `IO` che legge da `data_chan` e scrive su
-`response_chan`. Gli handler possono usarlo con qualsiasi API Crystal IO-aware
-(`gets`, `puts`, ecc.) senza sapere nulla di QUIC o dell'actor sottostante.
+`ActorStreamSocket` is an `IO` that reads from `data_chan` and writes to
+`response_chan`. Handlers can use it with any Crystal IO-aware API (`gets`, `puts`,
+etc.) without knowing anything about QUIC or the underlying actor.
 
-### 5. Pacing — invio cadenzato
+### 5. Pacing — rate-limited sending
 
-`flush_outgoing` implementa un token bucket per evitare micro-burst:
+`flush_outgoing` implements a token bucket to avoid micro-bursts:
 
 ```mermaid
 flowchart LR
     subgraph "Token Bucket"
         T["@pacing_tokens\nFloat64"]
-        R["pacing_rate_bps\ncwnd / srtt\noppure BBR"]
+        R["pacing_rate_bps\ncwnd / srtt\nor BBR"]
         B["max_burst\nrate × 10ms"]
         R -->|"+ rate × elapsed"| T
         B -->|"clamp max"| T
     end
 
     T -->|"> 0"| SND["send_coalesced\nudp.send\n@pacing_tokens -= n"]
-    T -->|"≤ 0"| STOP["break\naspetta prossimo tick"]
+    T -->|"≤ 0"| STOP["break\nwait for next tick"]
 ```
 
-`@pacing_tokens` inizia a `Float64::MAX` così l'handshake e lo slow-start
-non sono mai throttlati. Il rate viene fornito da `Recovery.pacing_rate_bps`:
-usa BBR `max_bandwidth × 1.25` quando disponibile, altrimenti `cwnd / srtt`.
+`@pacing_tokens` starts at `Float64::MAX` so the handshake and slow-start are never
+throttled. The rate is provided by `Recovery.pacing_rate_bps`: uses BBR
+`max_bandwidth × 1.25` when available, otherwise `cwnd / srtt`.
 
-### 6. Timer dinamico — svegliarsi al momento giusto
+### 6. Dynamic timer — waking up at the right time
 
-Il `timeout(next_tick_timeout)` calcola quando il prossimo evento è atteso:
+The `timeout(next_tick_timeout)` computes when the next event is expected:
 
 ```mermaid
 flowchart TD
     NE{"next_event_time\n= min(loss_time,\n  pto_deadline)"}
-    NE -->|"presente"| D{"delta\n= t - now"}
-    NE -->|"assente\nnessun pkt in volo"| I["50ms\nidle"]
-    D -->|"≤ 3ms"| F["3ms\nfloor anti-burst"]
+    NE -->|"present"| D{"delta\n= t - now"}
+    NE -->|"absent\nno packets in flight"| I["50ms\nidle"]
+    D -->|"≤ 3ms"| F["3ms\nanti-burst floor"]
     D -->|"> 3ms"| M["min(delta, 50ms)"]
 ```
 
-Il floor di 3ms è necessario su loopback: aioquic invia ACK in batch ogni
-~1ms (asyncio event loop). Con RTT ~2ms, `loss_time = T+2.25ms`. Senza floor
-il timer scatterebbe a T+2.25ms, prima del secondo batch ACK a T+3ms → falsi
-positivi → `cwnd` dimezzato → stallo da PTO. Il floor garantisce che il batch
-successivo sia già arrivato quando il timer si sveglia.
+The 3ms floor is necessary on loopback: aioquic sends ACKs in batches every ~1ms
+(asyncio event loop). With RTT ~2ms, `loss_time = T+2.25ms`. Without the floor the
+timer would fire at T+2.25ms, before the second ACK batch at T+3ms → false positives
+→ `cwnd` halved → PTO stall. The floor ensures the next batch has already arrived
+when the timer wakes up.
 
 ---
 
-## Sequence diagram completo — UDP in → HTTP response out
+## Full sequence diagram — UDP in → HTTP response out
 
 ```mermaid
 sequenceDiagram
@@ -223,23 +221,23 @@ sequenceDiagram
     participant HF as Handler Fiber
     participant RPC as response_chan
 
-    NET->>RF: datagram UDP
-    RF->>RF: batch_receiver.drain_nowait (GRO)
+    NET->>RF: UDP datagram
+    RF->>RF: batch_receiver.blocking_drain (GRO)
     RF->>RC: RouterPacket{data, addr}
 
     RC->>RL: msg = router_chan.receive
     RL->>RL: conn_key = extract_dcid(data)
-    RL->>RL: actor = connections[key]? (crea se nil)
+    RL->>RL: actor = connections[key]? (create if nil)
     RL->>PC: actor.deliver(data) → packet_chan.send
 
     PC->>CA: select arm 1: data = packet_chan.receive
-    CA->>CA: drain loop (svuota packet_chan)
+    CA->>CA: drain loop (flush packet_chan)
     CA->>QC: recv(data) — decrypt + parse frames
-    QC-->>CA: stream data disponibile
+    QC-->>CA: stream data available
     CA->>DC: forward_stream_data → data_chan.send(bytes)
     CA->>NET: flush_outgoing → udp.send (ACK, HANDSHAKE)
 
-    DC->>HF: handler legge header HTTP/3
+    DC->>HF: handler reads HTTP/3 headers
     HF->>HF: router dispatch + middleware
     HF->>RPC: response_chan.send({stream_id, response_bytes})
 
@@ -250,17 +248,17 @@ sequenceDiagram
 
 ---
 
-## Canali e tipi
+## Channels and types
 
-| Canale | Tipo | Capacità | Da → A | Scopo |
-|--------|------|----------|---------|-------|
-| `router_chan` | `Channel(RouterMsg)` | 4608 | Receiver / Actor → Router | tutti i messaggi verso il router |
-| `packet_chan` | `Channel(Bytes)` | 512 | Router → Actor | datagram QUIC grezzi |
-| `response_chan` | `Channel({UInt64, Bytes})` | 256 | Handler fiber → Actor | risposta HTTP codificata |
-| `data_chan` (per stream bidi) | `Channel(Bytes)` | 512 | Actor → Handler fiber | byte ricevuti dal peer |
-| `data_chan` (stream uni) | `Channel(Bytes)` | 16 | Actor → Uni handler | QPACK encoder/decoder/control |
+| Channel | Type | Capacity | From → To | Purpose |
+|---------|------|----------|-----------|---------|
+| `router_chan` | `Channel(RouterMsg)` | 4608 | Receiver / Actor → Router | all messages to the router |
+| `packet_chan` | `Channel(Bytes)` | 512 | Router → Actor | raw QUIC datagrams |
+| `response_chan` | `Channel({UInt64, Bytes})` | 256 | Handler fiber → Actor | encoded HTTP response |
+| `data_chan` (bidi stream) | `Channel(Bytes)` | 512 | Actor → Handler fiber | bytes received from peer |
+| `data_chan` (uni stream) | `Channel(Bytes)` | 16 | Actor → Uni handler | QPACK encoder/decoder/control |
 
-### RouterMsg — union type strutturato
+### RouterMsg — structured union type
 
 ```crystal
 record RouterPacket, data : Bytes, addr : Socket::IPAddress
@@ -269,12 +267,12 @@ record RouterClean,  key : String, addr_key : String
 alias RouterMsg = RouterPacket | RouterReg | RouterClean
 ```
 
-I tre `record` invece di tuple permettono al compilatore Crystal di fare
-narrowing nel `case/when` senza ambiguità di tipo nei `select` union.
+Three `record` types instead of tuples allow the Crystal compiler to narrow types
+in `case/when` without ambiguity in `select` unions.
 
 ---
 
-## Invariante no-mutex
+## No-mutex invariant
 
 ```mermaid
 graph LR
@@ -285,22 +283,22 @@ graph LR
         QC2["QUIC::Connection\nH3::Connection\nstream buffers"]
     end
     subgraph "Handler fiber N"
-        HF2["legge data_chan\nscrive response_chan"]
+        HF2["reads data_chan\nwrites response_chan"]
     end
 
     RL2 <-->|"packet_chan\n(Channel)"| QC2
     QC2 <-->|"data_chan / response_chan\n(Channel)"| HF2
-    RL2 -.->|"MAI accesso diretto"| QC2
-    HF2 -.->|"MAI accesso diretto"| QC2
+    RL2 -.->|"NEVER direct access"| QC2
+    HF2 -.->|"NEVER direct access"| QC2
 ```
 
-`QUIC::Connection` e `H3::Connection` non hanno mai lock perché sono
-accessibili solo dal fiber dell'actor. Router e handler comunicano
-esclusivamente via canali. I canali Crystal sono thread-safe per design.
+`QUIC::Connection` and `H3::Connection` never need locks because they are only
+accessible from the actor's fiber. Router and handlers communicate exclusively via
+channels. Crystal channels are thread-safe by design.
 
 ---
 
-## Ciclo di vita dell'actor
+## Actor lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -308,22 +306,22 @@ stateDiagram-v2
     Spawned --> Handshake : packet_chan.receive\nrecv_packet → CRYPTO frames
     Handshake --> H3Init : handshake_complete?\nopen control/QPACK streams
     H3Init --> Active : dispatch_new_streams\nspawn handler fibers
-    Active --> Active : arm1 pacchetti\narm2 risposte\narm3 tick
+    Active --> Active : arm1 packets\narm2 responses\narm3 tick
     Active --> Closing : quic_conn.closed?
-    Closing --> [*] : ensure\n stream_channels EOF\nRouterClean → router
+    Closing --> [*] : ensure\nstream_channels EOF\nRouterClean → router
 ```
 
-L'`ensure` alla fine di `run` garantisce il cleanup anche in caso di
-eccezione: invia `Bytes.empty` su tutti i `data_chan` aperti (segnale EOF
-agli handler) e invia `RouterClean` al Router per rimuovere le entry dalla mappa.
+The `ensure` at the end of `run` guarantees cleanup even on exception: it sends
+`Bytes.empty` on all open `data_chan`s (EOF signal to handlers) and sends
+`RouterClean` to the Router to remove entries from the map.
 
 ---
 
-## Multithreading con `-Dpreview_mt`
+## Multithreading with `-Dpreview_mt`
 
-Con il flag di build `preview_mt`, Crystal assegna i fiber agli OS thread
-dal pool di sistema. Actor diversi girano su core diversi senza modifiche
-al codice — i `Channel` sono thread-safe per design.
+With the `-Dpreview_mt` build flag, Crystal assigns fibers to OS threads from the
+system pool. Different actors run on different cores without code changes — `Channel`s
+are thread-safe by design.
 
 ```mermaid
 graph TD
@@ -347,4 +345,4 @@ graph TD
     CA4 <-->|"data/response chan"| HF4
 ```
 
-File di riferimento: `src/h3/connection_actor.cr`, `src/h3/server.cr`
+Reference files: `src/h3/connection_actor.cr`, `src/h3/server.cr`
