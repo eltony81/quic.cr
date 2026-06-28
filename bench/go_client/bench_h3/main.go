@@ -372,6 +372,7 @@ func main() {
 	crTr := newTransport()
 	defer crTr.Close()
 	// Warm up Crystal transport to complete the handshake and OpenSSL init
+	fmt.Print("  Warming up...")
 	cCr := &http.Client{Transport: crTr}
 	for i := 0; i < 30; i++ {
 		resp, err := cCr.Get(crystalBase + "/ping")
@@ -380,12 +381,14 @@ func main() {
 			resp.Body.Close()
 		}
 	}
+	fmt.Println(" done")
 	crRes := bench("Crystal quic.cr", crystalBase, *seqN, *concN, *concC, *tpN, crTr)
 
 	fmt.Println("Benchmarking Go quic-go…")
 	goTr := newTransport()
 	defer goTr.Close()
 	// Warm up Go transport to complete the handshake
+	fmt.Print("  Warming up...")
 	cGo := &http.Client{Transport: goTr}
 	for i := 0; i < 30; i++ {
 		resp, err := cGo.Get(goBase + "/ping")
@@ -394,6 +397,7 @@ func main() {
 			resp.Body.Close()
 		}
 	}
+	fmt.Println(" done")
 	goRes := bench("Go quic-go", goBase, *seqN, *concN, *concC, *tpN, goTr)
 
 	printReport(crRes, goRes)
