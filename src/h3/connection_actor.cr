@@ -264,7 +264,7 @@ module H3
     private def flush_outgoing
       now = Time.instant
       rate = @quic_conn.pacing_rate_bps
-      rate = 1_250_000_000.0 if rate < 1_250_000_000.0 # Floor pacing rate to 10 Gbps to prevent startup throttling
+      rate = 312_500_000.0 if rate < 312_500_000.0 # Floor pacing rate to 2.5 Gbps to prevent startup throttling
       elapsed = (now - @pacing_refill_at).total_seconds
       @pacing_refill_at = now
 

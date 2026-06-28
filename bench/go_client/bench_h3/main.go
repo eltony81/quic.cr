@@ -293,15 +293,28 @@ func printReport(cr, go_ result) {
 
 func main() {
 	crystalPort := flag.Int("crystal-port", 4433, "Crystal quic.cr server port")
-	goPort      := flag.Int("go-port", 4444, "Go quic-go server port (started inline)")
+	goPort      := flag.Int("go-port", 4444, "Go quic-go server port")
 	seqN        := flag.Int("seq-n", 300, "Sequential requests (latency benchmark)")
 	concN       := flag.Int("conc-n", 1000, "Total requests (concurrent benchmark)")
 	concC       := flag.Int("conc-c", 50, "Concurrency (concurrent benchmark)")
 	tpN         := flag.Int("tp-n", 20, "Requests for throughput benchmark (GET /100k)")
+	serverMode  := flag.Bool("server", false, "Run Go HTTP/3 server only")
 	flag.Parse()
 
 	payload100k := make([]byte, 100*1024)
-	rand.Read(payload100k) //nolint:errcheck
+	for i := range payload100k {
+		payload100k[i] = 'x'
+	}
+
+	if *serverMode {
+		_, err := startGoServer(*goPort, payload100k)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start Go server: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Go HTTP/3 server listening on udp://127.0.0.1:%d\n", *goPort)
+		select {}
+	}
 
 	crystalBase := fmt.Sprintf("https://127.0.0.1:%d", *crystalPort)
 	goBase      := fmt.Sprintf("https://127.0.0.1:%d", *goPort)
@@ -324,14 +337,22 @@ func main() {
 		fmt.Printf("Crystal server OK on :%d\n", *crystalPort)
 	}
 
-	// Start inline Go server
-	goSrv, err := startGoServer(*goPort, payload100k)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start Go server: %v\n", err)
-		os.Exit(1)
+	// Check Go server is reachable
+	{
+		tr := newTransport()
+		c := &http.Client{Transport: tr}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, "GET", goBase+"/ping", nil)
+		resp, err := c.Do(req)
+		tr.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Go server not reachable on :%d: %v\n", *goPort, err)
+			os.Exit(1)
+		}
+		resp.Body.Close()
+		fmt.Printf("Go server OK on :%d\n", *goPort)
 	}
-	defer goSrv.Close()
-	fmt.Printf("Go server started on :%d\n", *goPort)
 
 	fmt.Printf("Config: seq=%d  conc=%d/%d workers  tp=%d×100k\n",
 		*seqN, *concN, *concC, *tpN)

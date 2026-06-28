@@ -20,6 +20,7 @@ trap cleanup EXIT
 
 echo "==> Killing any leftover servers on :4433 / :4444..."
 pkill -f "/tmp/e2e_server" 2>/dev/null || true
+pkill -f "bench_h3" 2>/dev/null || true
 fuser -k 4433/udp 2>/dev/null || true
 fuser -k 4444/udp 2>/dev/null || true
 sleep 0.3
@@ -37,6 +38,12 @@ for i in {1..4}; do
   GC_INITIAL_HEAP_SIZE=100M "$E2E_BIN" &
   SERVER_PIDS+=($!)
 done
+
+echo "==> Starting Go server on :4444..."
+cd "$BENCH_DIR"
+./bench_h3 -server &
+SERVER_PIDS+=($!)
+
 sleep 0.8
 
 echo "==> Running benchmark..."
