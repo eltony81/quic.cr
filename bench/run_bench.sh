@@ -71,7 +71,7 @@ run_scenario() {
 
   echo "==> Starting Crystal server on :4433 ($workers workers)..."
   for ((i=1; i<=workers; i++)); do
-    GC_FREE_SPACE_DIVISOR=5 "$E2E_BIN" &
+    "$E2E_BIN" &
     server_pids+=($!)
   done
 
