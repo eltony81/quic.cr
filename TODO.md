@@ -136,6 +136,7 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
 
 ### 5. Performance Optimization Roadmap (completed and active work)
 - [x] **Rewrite Python benchmark client in Go** — Implemented Go HTTP/3 benchmark client in `bench/go_client/bench_h3`. It replaces the old Python/aioquic benchmark client, eliminating the dynamic GC overhead and providing highly accurate micro-second latency metrics.
+- [ ] **Migrate Python cross-validation tests to Go** — All remaining validation and cross-validation scripts (`bench/bench.py`, `examples/validate_cross_tests.py`, `examples/bench_qpack.py`) currently written in Python should be replaced by Go (or Crystal native) equivalents. Python's runtime memory management and GC pauses introduce excessive overhead, creating timing inconsistencies and skewing/falsifying comparative benchmark metrics.
 - [x] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
       every long-header and short-header packet to decode the 1–4 byte packet number.
       Replaced with direct byte reads. Eliminates 2× small allocs per packet.
