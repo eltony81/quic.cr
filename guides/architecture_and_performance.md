@@ -115,3 +115,39 @@ Understanding the performance difference in benchmarks requires examining runtim
 * **Go quic-go**: Uses a concurrent, low-latency tri-color collector running alongside the mutator. This allows Go to handle throughput stress with microsecond-level pauses.
 
 As a result, Crystal achieves **better sequential latency** (149µs vs 182µs) because of LLVM's aggressive compilation optimizations and zero thread-sync overhead, while Go maintains a throughput advantage under single-connection stress tests.
+
+---
+
+## 5. Codebase Directory Map & Key Components
+
+The codebase is organized into two primary layers under the `src/` directory: the core transport layer (`src/quic/`) and the application layer (`src/h3/`). Below is the mapping of all source files, their core classes/structs, and main functions.
+
+### Core Transport Layer: `src/quic/`
+
+| File Path | Core Classes / Modules | Key Functions & Purpose |
+|:---|:---|:---|
+| **[connection.cr](file:///home/tony/Projects/quic.cr/src/quic/connection.cr)** | `QUIC::Connection` | Coordinates connection state, packet parsing routing, frame processing, and version/key coordination.<br>• `#recv_packet(data : Bytes)`: Main entrance for incoming raw packets.<br>• `#send_coalesced(space : Space)`: Packs frames and serializes outgoing packets.<br>• `#handle_frame(frame : Frame)`: Processes specific parsed frames.<br>• `#trigger_key_update`: Toggles the TLS key phase and derives new secrets. |
+| **[tls.cr](file:///home/tony/Projects/quic.cr/src/quic/tls.cr)** | `QUIC::TLS` | Wraps OpenSSL bindings via `LibSSL` to run the secure TLS 1.3 handshake.<br>• `#handle_data(data : Bytes, level : UInt32)`: Drives the handshake state machine.<br>• `#derive_quic_keys(level : UInt32)`: Derives encryption/decryption keys per packet space.<br>• `self.generate_self_signed_cert`: Runs a subprocess call to generate certs when files are absent. |
+| **[recovery.cr](file:///home/tony/Projects/quic.cr/src/quic/recovery.cr)** | `QUIC::Recovery`, `QUIC::PathRecovery` | Implements loss detection timers and congestion control (CUBIC, NewReno, BBR).<br>• `#on_packet_sent(pn, bytes, space)`: Registers in-flight packets.<br>• `#on_ack_received(ack_frame, space)`: Updates RTT estimates and congestion window.<br>• `#detect_lost_packets(space)`: Scans for lost packets using time/packet limits. |
+| **[batch_receiver.cr](file:///home/tony/Projects/quic.cr/src/quic/batch_receiver.cr)** | `QUIC::BatchReceiver` | Handles non-blocking UDP socket reading via `recvmmsg` and GRO support.<br>• `#blocking_drain(socket)`: Fiber-aware wait and bulk read of socket packets.<br>• `#each_segment(index, &block)`: Extracts individual QUIC packets from a GRO superpacket. |
+| **[batch_sender.cr](file:///home/tony/Projects/quic.cr/src/quic/batch_sender.cr)** | `QUIC::BatchSender` | High-performance UDP socket writing with GSO support.<br>• `#flush_sendmmsg`: Flushes multiple queued packets individually using `sendmsg` / `sendmmsg`.<br>• `#flush_gso`: Merges packets into a single coalesced GSO superpacket before sending. |
+| **[crypto.cr](file:///home/tony/Projects/quic.cr/src/quic/crypto.cr)** | `QUIC::AEAD`, `QUIC::HeaderProtection` | Encrypts/decrypts packet payloads and applies/removes header protection masks.<br>• `AEAD#encrypt`/`#decrypt`: In-place packet crypt using cached context.<br>• `HeaderProtection#apply_mask`/`#remove_mask`: Header protection masking via cached AES. |
+| **[slice_reader.cr](file:///home/tony/Projects/quic.cr/src/quic/slice_reader.cr)** | `QUIC::SliceReader` | Fast, zero-allocation memory wrapper replacing generic `IO` on hot paths.<br>• `#read_byte`: Returns the current byte and advances index.<br>• `#read_varint`: Directly decodes a QUIC VarInt from memory without allocations. |
+| **[varint.cr](file:///home/tony/Projects/quic.cr/src/quic/varint.cr)** | `QUIC::VarInt` | Encoder and decoder for Variable-Length Integers (RFC 9000 §16).<br>• `self.write(io, value)`: Serializes integer into wire-format bytes.<br>• `self.decode(io : SliceReader)`: Statically-dispatched decoder for zero-allocation parsing. |
+| **[stream.cr](file:///home/tony/Projects/quic.cr/src/quic/stream.cr)** | `QUIC::Stream` | Manages single stream buffers and stream-level flow control.<br>• `#write(data)`: Buffers payload bytes to send.<br>• `#read(data)`: Reads payload bytes received.<br>• `#poll_send_data(max_len, conn_av)`: Extracts packets bounded by connection and stream windows. |
+| **[packet.cr](file:///home/tony/Projects/quic.cr/src/quic/packet.cr)** / **[packet_parsing.cr](file:///home/tony/Projects/quic.cr/src/quic/packet_parsing.cr)** | `QUIC::Packet`, `QUIC::LongHeaderPacket`, `QUIC::ShortHeaderPacket` | Defines packet schemas and handles serialization/parsing.<br>• `Packet.parse(reader, conn_id_len)`: Resolves packet type and initializes headers.<br>• `#serialize(connection)`: Packs headers and payloads into wire format. |
+| **[frame.cr](file:///home/tony/Projects/quic.cr/src/quic/frame.cr)** | `QUIC::Frame`, `QUIC::StreamFrame`, `QUIC::AckFrame` | Encapsulates QUIC frames.<br>• `Frame.decode(reader)`: Decodes raw frames from plaintext packets.<br>• `#serialize(writer)`: Encodes frames back to wire format. |
+| **[server.cr](file:///home/tony/Projects/quic.cr/src/quic/server.cr)** | `QUIC::Server` | A generic UDP server that accepts incoming connections and routes traffic. |
+
+### HTTP/3 Application Layer: `src/h3/`
+
+| File Path | Core Classes / Modules | Key Functions & Purpose |
+|:---|:---|:---|
+| **[connection_actor.cr](file:///home/tony/Projects/quic.cr/src/h3/connection_actor.cr)** | `H3::ConnectionActor` | Links QUIC and HTTP/3 streams together by acting as a single connection coordinator.<br>• `#run`: Loop that handles incoming packets, timers, and flushes outgoing data.<br>• `#flush_outgoing`: Drives pacing and writes pending frames to the socket. |
+| **[server.cr](file:///home/tony/Projects/quic.cr/src/h3/server.cr)** | `H3::Server` | High-level HTTP/3 Server binding, binding socket, and spawning connection actors. |
+| **[qpack.cr](file:///home/tony/Projects/quic.cr/src/h3/qpack.cr)** | `QPACK::Encoder`, `QPACK::Decoder` | Compresses and decompresses HTTP headers.<br>• `#encode`/`#decode`: Decodes headers using static/dynamic lookup tables.<br>• `self.encode_huffman`/`self.decode_huffman`: Huffman-compresses header strings. |
+| **[client.cr](file:///home/tony/Projects/quic.cr/src/h3/client.cr)** | `H3::Client` | High-level HTTP/3 client interface.<br>• `#get(path)` / `#post(path, body, headers)`: Send requests and read responses. |
+| **[response_ring.cr](file:///home/tony/Projects/quic.cr/src/h3/response_ring.cr)** | `H3::ResponseRing` | Replaces channel blocks with a thread-safe, lock-free Deque to feed responses to the actor. |
+| **[router.cr](file:///home/tony/Projects/quic.cr/src/h3/router.cr)** | `H3::Router` | HTTP router matching requests to handlers (`#get`, `#post`, etc.). |
+| **[request.cr](file:///home/tony/Projects/quic.cr/src/h3/request.cr)** / **[response.cr](file:///home/tony/Projects/quic.cr/src/h3/response.cr)** | `H3::Request`, `H3::Response` | Models HTTP/3 headers, query parameters, body buffers, and response payloads. |
+
