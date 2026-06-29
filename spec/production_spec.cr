@@ -61,4 +61,28 @@ describe "Production Engineering" do
       conn.peer_cid_count.should eq(0)
     end
   end
+
+  describe "Memory stability" do
+    it "does not grow RSS unboundedly after 200 connection open/close cycles" do
+      GC.collect
+      rss_before = File.read("/proc/self/status")
+        .scan(/VmRSS:\s+(\d+)/)
+        .first?.try(&.[1].to_i) || 0
+
+      200.times do
+        conn = QUIC::Connection.new(QUIC::Config.new, is_server: true)
+        conn.close(0_u64, "done")
+      end
+
+      GC.collect
+      rss_after = File.read("/proc/self/status")
+        .scan(/VmRSS:\s+(\d+)/)
+        .first?.try(&.[1].to_i) || 0
+
+      # Allow up to 3× growth — Boehm GC is lazy and may not have collected
+      # everything, but unbounded C-heap leaks would exceed this threshold.
+      growth = rss_after.to_f / [rss_before, 1].max
+      growth.should be <= 3.0
+    end
+  end
 end
