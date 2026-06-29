@@ -1,5 +1,8 @@
 # quic.cr
 
+> [!WARNING]
+> This project was generated with AI.
+
 A pure-Crystal HTTP/3 and QUIC implementation.  No external Crystal shard dependencies.
 
 Crystal >= 1.20.2 required.  TLS is handled through OpenSSL via LibSSL's native QUIC API.
