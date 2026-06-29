@@ -45,10 +45,32 @@ router.get "/users/:id"  { |ctx| ctx.json %({"id":"#{ctx.request.path_params["id
 router.post "/echo"      { |ctx| ctx.text ctx.body_string }
 
 # Start the server (auto-generates self-signed cert.pem/key.pem if missing)
+# You can also manually specify them:
+# H3::Server.new(router).listen(host: "0.0.0.0", port: 4433, cert: "cert.pem", key: "key.pem")
 H3::Server.new(router).listen(host: "0.0.0.0", port: 4433)
 ```
 
 ---
+
+## Client API
+
+```crystal
+require "../src/quic"
+
+config = QUIC::Config.new
+client = H3::Client.new("127.0.0.1", 4433, config)
+
+# GET Request
+headers, body, trailers = client.get("/greet?name=Crystal")
+puts "Status: #{headers[":status"]}"
+puts "Body: #{String.new(body)}"
+
+# POST Request
+headers, body, trailers = client.post("/echo", %({"msg": "hello"}), {"content-type" => "application/json"})
+puts "Response: #{String.new(body)}"
+
+client.close
+```
 
 ## Running the validation tests
 
