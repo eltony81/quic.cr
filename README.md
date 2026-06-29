@@ -98,6 +98,20 @@ Both the client and server use `QUIC::Config` to define connection parameters. Y
 
 *(Note: `H3::Server` overrides several of the `initial_max_*` flow control defaults internally for HTTP/3 optimization.)*
 
+### Example: Customizing the Config
+
+```crystal
+require "../src/quic"
+
+config = QUIC::Config.new
+config.max_idle_timeout = 60_000 # 60 seconds
+config.initial_max_streams_bidi = 256
+config.initial_cwnd_packets = 200
+
+# Passing the config to a Client:
+client = H3::Client.new("127.0.0.1", 4433, config)
+```
+
 ---
 
 ## Running the validation tests
