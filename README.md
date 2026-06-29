@@ -72,6 +72,34 @@ puts "Response: #{String.new(body)}"
 client.close
 ```
 
+---
+
+## QUIC Configuration
+
+Both the client and server use `QUIC::Config` to define connection parameters. You can customize the behavior of the transport layer by modifying these properties before starting a connection or server.
+
+| Property | Default | Description |
+|---|---|---|
+| `max_idle_timeout` | `30_000` | Maximum idle timeout in milliseconds. |
+| `max_udp_payload_size` | `1200` | Maximum UDP payload size. |
+| `initial_max_data` | `0` | Initial connection-level flow control window. |
+| `initial_max_stream_data_bidi_local` | `0` | Initial flow control window for local bidirectional streams. |
+| `initial_max_stream_data_bidi_remote` | `0` | Initial flow control window for remote bidirectional streams. |
+| `initial_max_stream_data_uni` | `0` | Initial flow control window for unidirectional streams. |
+| `initial_max_streams_bidi` | `0` | Maximum number of concurrent bidirectional streams. |
+| `initial_max_streams_uni` | `0` | Maximum number of concurrent unidirectional streams. |
+| `ack_delay_exponent` | `3` | Exponent used to decode the ACK Delay field. |
+| `max_ack_delay` | `25` | Maximum amount of time in milliseconds to delay an ACK. |
+| `max_datagram_frame_size` | `0` | Maximum size of a DATAGRAM frame. |
+| `initial_cwnd_packets` | `128` | Initial congestion window in MTU-sized packets. |
+| `cert_file` | `"cert.pem"` | Path to the TLS certificate file. |
+| `key_file` | `"key.pem"` | Path to the TLS private key file. |
+| `session_ticket` | `nil` | Optional TLS session ticket for 0-RTT client resumption (`Bytes?`). |
+
+*(Note: `H3::Server` overrides several of the `initial_max_*` flow control defaults internally for HTTP/3 optimization.)*
+
+---
+
 ## Running the validation tests
 
 The validation suite checks interoperability between the Crystal server and a Go HTTP/3 client (`quic-go`).
