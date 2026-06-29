@@ -20,15 +20,24 @@ module QUIC
       buffer = Bytes.new(2048)
       out_buf = Bytes.new(2048)
       batch_sender = BatchSender.new(@socket)
+      # RFC 9000 §8.1: per-IP amplification tracking (rx/tx bytes) before
+      # address validation. Limit tx to 3× rx to prevent spoofed-IP DDoS
+      # amplification. Entries are removed once the handshake completes.
+      amp = {} of String => {rx: UInt64, tx: UInt64}
       loop do
         size, client_addr = @socket.receive(buffer)
         data = buffer[0, size]
 
         begin
+          amp_key = client_addr.to_s
+          entry = amp[amp_key]?
+          amp[amp_key] = {rx: (entry.try(&.[:rx]) || 0_u64) + size.to_u64,
+                          tx: entry.try(&.[:tx]) || 0_u64}
+
           io = IO::Memory.new(data)
           first_byte = io.read_byte.not_nil!
           is_long = (first_byte & 0x80) != 0
-          
+
           version = 0x00000000_u32
           dcid = Bytes.empty
           scid = Bytes.empty
@@ -40,11 +49,11 @@ module QUIC
             dcid_len = io.read_byte.not_nil!
             dcid = Bytes.new(dcid_len)
             io.read_fully(dcid)
-            
+
             scid_len = io.read_byte.not_nil!
             scid = Bytes.new(scid_len)
             io.read_fully(scid)
-            
+
             type_bits = (first_byte >> 4) & 0x03
             if type_bits == 0x00 # Initial
               token_len = VarInt.decode(io)
@@ -65,10 +74,10 @@ module QUIC
             @socket.send(out_buf.to_slice, client_addr)
             next
           end
-          
+
           conn_key = dcid.hexstring
           conn = @connections[conn_key]?
-          
+
           if conn.nil?
             if !is_long
               reset_first = 0x40_u8 | Random::Secure.rand(64).to_u8
@@ -110,18 +119,41 @@ module QUIC
               next # Ignore unexpected packets
             end
           end
-          
+
           conn.recv(data)
 
-          # 3. Drain outgoing packets into batch; flush via sendmmsg
-          while (out_size = conn.send_coalesced(out_buf)) > 0
-            batch_sender.add(out_buf[0, out_size], client_addr)
+          # 3. Drain outgoing packets into batch; flush via sendmmsg.
+          # Enforce RFC 9000 §8.1 amplification limit (3× rx bytes) until the
+          # handshake completes and the client's address is considered validated.
+          validated = conn.handshake_complete? || !amp.has_key?(amp_key)
+          if validated
+            amp.delete(amp_key)
+            while (out_size = conn.send_coalesced(out_buf)) > 0
+              batch_sender.add(out_buf[0, out_size], client_addr)
+            end
+          else
+            cur = amp[amp_key]
+            while (out_size = conn.send_coalesced(out_buf)) > 0
+              if cur[:tx] + out_size.to_u64 <= cur[:rx] * 3
+                batch_sender.add(out_buf[0, out_size], client_addr)
+                cur = {rx: cur[:rx], tx: cur[:tx] + out_size.to_u64}
+                amp[amp_key] = cur
+              else
+                # Limit reached — stop sending; client's next datagram will
+                # advance the rx counter and unblock future sends.
+                Log.debug { "Amplification limit reached for #{amp_key}: tx=#{cur[:tx]} rx=#{cur[:rx]}" }
+                break
+              end
+            end
           end
           batch_sender.flush
-          
+
           # 4. Cleanup closed connections
-          @connections.delete(conn_key) if conn.closed?
-          
+          if conn.closed?
+            @connections.delete(conn_key)
+            amp.delete(amp_key)
+          end
+
         rescue e
           Log.warn { "Server receive loop: #{e.class} from #{client_addr rescue "unknown"} — #{e.message}" }
         end
