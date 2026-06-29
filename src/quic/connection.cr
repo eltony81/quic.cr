@@ -64,6 +64,9 @@ module QUIC
     @close_error : UInt64 = 0
     @close_reason : String = ""
 
+    # RFC 9000 §10.1 — idle timeout: updated on every successfully received packet.
+    @last_recv_time : Time = Time.local
+
     # RESET_STREAM frames to emit on next send (stream_id, error_code, final_size).
     @pending_reset_streams = [] of {UInt64, UInt64, UInt64}
 
@@ -109,7 +112,24 @@ module QUIC
           candidates << pto
         end
       end
+      # RFC 9000 §10.1: also wake up when the idle timeout deadline arrives.
+      if (ms = effective_idle_timeout_ms) > 0
+        candidates << @last_recv_time + ms.milliseconds
+      end
       candidates.min?
+    end
+
+    # RFC 9000 §10.1: effective idle timeout = min(local, remote), ignoring zeros.
+    # Returns 0 if both endpoints disabled idle timeout.
+    private def effective_idle_timeout_ms : UInt64
+      local  = @config.max_idle_timeout
+      remote = @tls.remote_transport_parameters.try(&.max_idle_timeout) || 0_u64
+      case
+      when local == 0 && remote == 0 then 0_u64
+      when local  == 0               then remote
+      when remote == 0               then local
+      else                                Math.min(local, remote)
+      end
     end
 
     # Returns serialized TLS session bytes for 0-RTT resumption on the next connection.
@@ -258,6 +278,17 @@ module QUIC
             queue_lost_frames(@recovery.detect_lost_packets(la, space_id: 2)) if la > 0
           end
         end
+
+        # RFC 9000 §10.1: silently close the connection when the idle period expires.
+        # "Silent" means no CONNECTION_CLOSE frame — just mark closed locally.
+        # Only enforce after handshake so the timeout doesn't fire before the peer
+        # has had a chance to send anything.
+        if (ms = effective_idle_timeout_ms) > 0
+          if now >= @last_recv_time + ms.milliseconds
+            Log.debug { "Idle timeout (#{ms}ms): closing connection silently" }
+            @closed = true
+          end
+        end
       end
     end
 
@@ -304,6 +335,9 @@ module QUIC
           break if consumed <= 0
           offset += consumed
         end
+
+        # RFC 9000 §10.1: restart the idle timer on every successfully processed datagram.
+        @last_recv_time = Time.local
 
         data.size
       rescue e : QUIC::Error

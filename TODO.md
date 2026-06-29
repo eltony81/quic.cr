@@ -200,6 +200,13 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
       unidirezionale server-initiated (ID % 4 == 3), emette push stream type byte,
       push_id VarInt, HEADERS + DATA frame. `@next_push_id` counter per push_id univoci.
       11 test in `spec/h3_push_spec.cr`.
+- [x] **Idle Timeout (RFC 9000 §10.1)**: `Connection` traccia `@last_recv_time`
+      (aggiornato su ogni `recv()` riuscito). `effective_idle_timeout_ms` calcola
+      `min(local, remote)` ignorando gli zero. `tick()` chiude silenziosamente
+      (`@closed = true`, nessun `CONNECTION_CLOSE`) quando `now >= @last_recv_time +
+      effective_timeout` — gated su `handshake_complete?` per non toccare connessioni
+      in handshake. `next_event_time` include la deadline idle come candidata al timer
+      dell'actor. Default: 30 000 ms. Spec: `idle_timeout_spec.cr` (7 test).
 - [ ] **WebTransport / Extended CONNECT (RFC 9298)**: nessun handling del metodo
       `CONNECT` né upgrade di stream bidirezionali. Richiesto per use-case real-time
       (gaming, video conferencing). quic-go ha `webtransport-go` separato.
