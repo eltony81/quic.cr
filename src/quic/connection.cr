@@ -169,6 +169,9 @@ module QUIC
     @send_header_io  = IO::Memory.new(256)
     @send_ad_io      = IO::Memory.new(256)
     @payload_reader  = SliceReader.new
+    # Reused for initial datagram header parsing in recv_packet — eliminates
+    # one IO::Memory.new per received UDP datagram on the hot path.
+    @recv_reader     = SliceReader.new
     @dcid_locked = false
 
     # Key Update (RFC 9001 §6): KEY_PHASE bit in short-header packets.
@@ -266,6 +269,14 @@ module QUIC
           end
         end
       end
+    end
+
+    # Remove fully-done streams from the stream table. Call this from the actor
+    # AFTER forward_stream_data has run, so the actor can clean its own maps
+    # first (forward_stream_data iterates @streams and must see them one last
+    # time before QUIC removes them).
+    def cleanup_done_streams : Nil
+      @streams.reject! { |_, stream| stream.fully_done? }
     end
 
     def recv(data : Bytes) : Int32
@@ -973,13 +984,13 @@ module QUIC
 
       if space == @space_app && @pmtud_probe_size > @path_mtu && @pmtud_probe_pn.nil?
         packet.frames << PingFrame.new
-        payload_io = IO::Memory.new
-        packet.frames.each &.encode(payload_io)
-        payload_size = payload_io.to_slice.size
-        
-        header_io = IO::Memory.new
-        packet.encode_header(header_io)
-        header_size = header_io.to_slice.size
+        @send_payload_io.clear
+        packet.frames.each &.encode(@send_payload_io)
+        payload_size = @send_payload_io.pos
+
+        @send_header_io.clear
+        packet.encode_header(@send_header_io)
+        header_size = @send_header_io.pos
         
         current_size = header_size + 4 + payload_size + 16
         if current_size < @pmtud_probe_size
@@ -1020,14 +1031,14 @@ module QUIC
       
       # For client Initial packets, RFC 9000 Section 14.1 requires padding to at least 1200 bytes
       if !@is_server && packet.is_a?(LongHeaderPacket) && packet.type == PacketType::Initial
-        payload_io = IO::Memory.new
-        packet.frames.each &.encode(payload_io)
-        payload_size = payload_io.to_slice.size
-        
-        header_io = IO::Memory.new
-        packet.encode_header(header_io)
-        VarInt.write(header_io, 1200_u64)
-        header_size = header_io.to_slice.size
+        @send_payload_io.clear
+        packet.frames.each &.encode(@send_payload_io)
+        payload_size = @send_payload_io.pos
+
+        @send_header_io.clear
+        packet.encode_header(@send_header_io)
+        VarInt.write(@send_header_io, 1200_u64)
+        header_size = @send_header_io.pos
         
         current_size = header_size + 4 + payload_size + 16
         if current_size < 1200

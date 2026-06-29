@@ -192,5 +192,14 @@ module QUIC
     def has_send_data? : Bool
       (@send_read_pos < @send_buffer.size) || (should_send_fin? && !@fin_sent)
     end
+
+    # Returns true when the stream has exchanged FINs in both directions,
+    # all local send data has been enqueued, and the local FIN was sent.
+    # Safe to remove from the connection's stream table at this point.
+    # (Retransmission state lives in the recovery module, not in Stream.)
+    def fully_done? : Bool
+      return true if @state == StreamState::Reset
+      @state == StreamState::Closed && @fin_sent && @send_read_pos >= @send_buffer.size
+    end
   end
 end

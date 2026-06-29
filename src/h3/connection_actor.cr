@@ -98,6 +98,9 @@ module H3
           # the whole packet batch — reduces channel sends from O(packets) to
           # O(MB / 64KB) ≈ 16 sends for 1MB instead of ~680.
           forward_stream_data
+          # Clean up fully-done streams AFTER forward_stream_data so the actor
+          # maps are purged first, then the QUIC stream table is pruned.
+          @quic_conn.cleanup_done_streams
           # Send ACKs / stream data immediately before yielding — keeps the
           # congestion-control feedback loop tight for throughput.
           flush_outgoing
@@ -210,18 +213,28 @@ module H3
     private def forward_stream_data
       @quic_conn.streams.each do |stream_id, stream|
         next unless chan = @stream_channels[stream_id]?
-        next if @stream_eof_sent.includes?(stream_id)
 
-        loop do
-          n = stream.read(@fwd_buf)
-          break if n == 0
-          chan.send(@fwd_buf[0, n].dup)
+        unless @stream_eof_sent.includes?(stream_id)
+          loop do
+            n = stream.read(@fwd_buf)
+            break if n == 0
+            chan.send(@fwd_buf[0, n].dup)
+          end
+
+          state = stream.state
+          if state.half_closed_remote? || state.closed?
+            chan.send(Bytes.empty)
+            @stream_eof_sent << stream_id
+          end
         end
 
-        state = stream.state
-        if state.half_closed_remote? || state.closed?
-          chan.send(Bytes.empty)
-          @stream_eof_sent << stream_id
+        # Streams fully done at QUIC level won't appear in future iterations
+        # (connection.cr removes them). Clean up actor-side maps now so that
+        # @stream_channels and @stream_eof_sent don't accumulate indefinitely.
+        if stream.fully_done?
+          @stream_channels.delete(stream_id)
+          @handled_streams.delete(stream_id)
+          @stream_eof_sent.delete(stream_id)
         end
       end
     end

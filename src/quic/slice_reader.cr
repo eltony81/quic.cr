@@ -82,6 +82,11 @@ module QUIC
       end
     end
 
+    def skip(n : Int32 | Int64 | UInt64) : Nil
+      advance = Math.min(n.to_i, @slice.size - @pos)
+      @pos += advance if advance > 0
+    end
+
     def write(slice : Bytes) : Nil
       raise IO::Error.new("SliceReader is read-only")
     end
