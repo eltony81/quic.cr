@@ -3,7 +3,7 @@
 > [!WARNING]
 > This project was generated with AI.
 
-A pure-Crystal HTTP/3 and QUIC implementation.  No external Crystal shard dependencies.
+A native, pure-Crystal implementation of the QUIC transport protocol (RFC 9000) and HTTP/3 (RFC 9114). Features a sans-I/O QUIC core, QPACK compression, and a robust HTTP/3 client and server. No external Crystal shard dependencies.
 
 Crystal >= 1.20.2 required.  TLS is handled through OpenSSL via LibSSL's native QUIC API.
 
