@@ -18,8 +18,10 @@ jobs:
         with:
           crystal: latest
 
-      - name: Install OpenSSL dev
-        run: sudo apt-get install -y libssl-dev
+      - name: Install OpenSSL 3 via Homebrew
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install openssl@3
+          echo "PKG_CONFIG_PATH=/home/linuxbrew/.linuxbrew/opt/openssl@3/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Run unit tests
         run: crystal spec
@@ -39,8 +41,10 @@ jobs:
         with:
           crystal: latest
 
-      - name: Install OpenSSL dev
-        run: sudo apt-get install -y libssl-dev
+      - name: Install OpenSSL 3 via Homebrew
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install openssl@3
+          echo "PKG_CONFIG_PATH=/home/linuxbrew/.linuxbrew/opt/openssl@3/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -52,9 +56,10 @@ jobs:
 
       - name: Generate TLS certs
         run: |
-          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+          /home/linuxbrew/.linuxbrew/opt/openssl@3/bin/openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
             -days 1 -nodes -subj '/CN=localhost'
 
       - name: Run cross-tests
         run: timeout 120 python examples/validate_cross_tests.py
         timeout-minutes: 3
+
