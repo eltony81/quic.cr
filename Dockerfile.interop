@@ -1,0 +1,27 @@
+# QUIC Interop Runner image for quic.cr
+# Usage: docker build -f Dockerfile.interop -t quic-cr-interop .
+# Compatible with https://github.com/marten-seemann/quic-interop-runner
+
+FROM crystallang/crystal:latest AS builder
+WORKDIR /app
+COPY . .
+RUN crystal build examples/interop_server.cr -o /interop_server --release --no-debug
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libssl3 libc6 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /interop_server /interop_server
+
+# Interop runner mounts certs at /certs and files at /www
+ENV CERT=/certs/cert.pem \
+    KEY=/certs/key.pem \
+    WWW=/www \
+    HOST=0.0.0.0 \
+    PORT=443 \
+    TESTCASE=handshake
+
+EXPOSE 443/udp
+
+ENTRYPOINT ["/interop_server"]
