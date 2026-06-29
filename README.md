@@ -400,6 +400,8 @@ The following standards are implemented.  Partial support is noted inline.
 | RFC 9297 | HTTP Datagrams — Quarter Stream ID prefix, `H3_DATAGRAM` SETTINGS (0x33) |
 | RFC 9218 | Extensible Prioritization Scheme — `PRIORITY_UPDATE` frame parse (0xF0700/0xF0701) |
 | Draft Multipath | Multi-path QUIC — per-path congestion control, active path selection |
+| RFC 9298 | WebTransport (Extended CONNECT) — *Planned* |
+| RFC 9220 | Bootstrapping WebSockets with HTTP/3 — *Planned* |
 
 ### Path MTU Discovery
 
