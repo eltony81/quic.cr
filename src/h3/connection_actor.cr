@@ -43,14 +43,18 @@ module H3
     # Starts unlimited so the handshake and initial burst are never throttled.
     @pacing_tokens    : Float64 = Float64::MAX
     @pacing_refill_at : Time::Instant = Time.instant
+    # Optional callback invoked when the actor's run loop exits (used by drain).
+    @on_close         : (-> Nil)?
 
     def initialize(
       @quic_conn, @h3_conn, @peer_addr, @udp, @server,
-      @router_chan, @initial_key
+      @router_chan, @initial_key,
+      on_close : (-> Nil)? = nil
     )
+      @on_close       = on_close
       @packet_chan    = Channel(Bytes).new(512)
-      @response_ring = ResponseRing.new
-      @wake_chan     = Channel(Nil).new(1)
+      @response_ring  = ResponseRing.new
+      @wake_chan      = Channel(Nil).new(1)
       @out_buf = Bytes.new(65536)
       @fwd_buf = Bytes.new(65536)
       @batch_sender = QUIC::BatchSender.new(@udp)
@@ -116,6 +120,8 @@ module H3
     rescue e
       Log.error(exception: e) { "Actor #{@initial_key[0, 8]} crashed: #{e.class}" }
     ensure
+      @on_close.try &.call
+      Metrics.conn_close
       @stream_channels.each_value do |ch|
         select
         when ch.send(Bytes.empty)
@@ -227,6 +233,7 @@ module H3
         if stream_id % 4 == 0
           # Client-initiated bidirectional: HTTP/3 request
           @handled_streams << stream_id
+          Metrics.request
           data_chan = Channel(Bytes).new(512)
           @stream_channels[stream_id] = data_chan
           sock = ActorStreamSocket.new(stream_id, data_chan, self)
