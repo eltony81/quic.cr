@@ -54,63 +54,27 @@ H3::Server.new(router).listen(
 
 ## Running the validation tests
 
-The validation suite checks interoperability between the Crystal server/client and
-aioquic (Python HTTP/3).  It requires a Python virtualenv with aioquic installed.
+The validation suite checks interoperability between the Crystal server and a Go HTTP/3 client (`quic-go`).
 
 ```bash
-# Set up the Python environment once
-python3 -m venv venv
-source venv/bin/activate
-pip install aioquic
+# Compile and run the cross-validation tests
+cd bench/go_client/cross_test
+go build -o cross_test .
 
-# Run all interoperability tests
-source venv/bin/activate
-python examples/validate_cross_tests.py
+# Run with auto-start of the Crystal server
+./cross_test -start-server
 ```
 
 ### What the tests cover
 
-**Phase 1 — Python client → Crystal server (10 cases)**
+**Phase 1 — HTTP/3 Request Correctness (18 cases)**
+Basic functionality testing, GET/POST/PUT/PATCH/DELETE routing, header echoing, payload size edge cases (100k, 1MB), SHA256 payload integrity, and concurrent request handling.
 
-| # | Test | What it checks |
-|---|------|----------------|
-| 1 | GET / | Basic HTML response |
-| 2 | GET /greet?name=… | Query-string routing |
-| 3 | GET /users/123 | Path-parameter routing |
-| 4 | POST /echo (JSON) | Request body parsing & echo |
-| 5 | DELETE /users/99 | Method routing |
-| 6 | Custom headers | CORS / middleware headers |
-| 7 | GET /non_existent | 404 handling |
-| 8 | POST /echo (1 MB) | Large-payload transfer |
-| 9 | 3 sequential requests | QPACK encoder state |
-| 10 | PATH_CHALLENGE | Connection migration handling |
+**Phase 2 — Robustness & Edge Cases (6 cases)**
+Handling sequential requests, 404 routing, multi-connection isolation, 64k payload testing, and dynamic QPACK state persistence across requests.
 
-**Phase 2 — Crystal client → Python server (8 cases)**
-
-Mirrors Phase 1 in reverse to validate the Crystal HTTP/3 client.
-
-### Expected output
-
-```
-============================================================
-🧪 PHASE 1: Running Interoperability Tests against Crystal Routed Server
-============================================================
-🚀 Starting examples/h3_server_routed...
-👉 Case 1: GET /
-   ✅ PASS
-👉 Case 2: GET /greet?name=Interoperability
-   ✅ PASS
-...
-👉 Case 10: Connection Migration — PATH_CHALLENGE/PATH_RESPONSE transparent handling
-   ✅ PASS (server transparently handled path validation)
-🔌 Crystal Server terminated.
-
-============================================================
-🧪 PHASE 2: Running Crystal Client against Python Server (aioquic)
-============================================================
-...
-🎉 ALL HTTP/3 INTEROPERABILITY & STRESS TESTS COMPLETED SUCCESSFULLY!
-```
+**Phase 3 — RFC 9114 Rejection Behaviors (5 cases)**
+Low-level injection of raw HTTP/3 frames. Validates connection rejection behaviors such as `DATA` before `HEADERS`, missing `:method`, or `SETTINGS` frames inappropriately sent on request streams.
 
 ---
 
@@ -433,7 +397,7 @@ See `TODO.md` for known limitations and planned work.
 ## Contributing
 
 1. Fork → feature branch → commit → pull request.
-2. Run `crystal spec` and `python examples/validate_cross_tests.py` before opening a PR.
+2. Run `crystal spec` and `cd bench/go_client/cross_test && go build . && ./cross_test -start-server` before opening a PR.
 
 ## License
 
