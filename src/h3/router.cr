@@ -121,7 +121,7 @@ end
 
 # Extend H3::Request so handlers can read path params stored by the router.
 module H3
-  class Request
+  struct Request
     # Returns path parameters captured by the router (e.g. :id -> "42").
     def path_params : Hash(String, String)
       result = {} of String => String

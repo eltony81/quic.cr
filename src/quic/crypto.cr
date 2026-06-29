@@ -4,12 +4,25 @@ require "openssl/hmac"
 # Extend LibCrypto with missing GCM control functions
 lib LibCrypto
   fun evp_cipher_ctx_ctrl = EVP_CIPHER_CTX_ctrl(ctx : EVP_CIPHER_CTX, type : Int32, arg : Int32, ptr : Void*) : Int32
+  fun evp_cipherinit_ex = EVP_CipherInit_ex(ctx : EVP_CIPHER_CTX, cipher : Void*, engine : Void*, key : UInt8*, iv : UInt8*, enc : Int32) : Int32
   EVP_CTRL_GCM_GET_TAG = 0x10
   EVP_CTRL_GCM_SET_TAG = 0x11
 end
 
 # Extend OpenSSL::Cipher with AEAD support
 class OpenSSL::Cipher
+  def reset_iv(iv : Bytes)
+    if LibCrypto.evp_cipherinit_ex(@ctx, nil, nil, nil, iv, -1) != 1
+      raise Error.new "EVP_CipherInit_ex (reset_iv)"
+    end
+  end
+
+  def reset_ecb
+    if LibCrypto.evp_cipherinit_ex(@ctx, nil, nil, nil, nil, -1) != 1
+      raise Error.new "EVP_CipherInit_ex (reset_ecb)"
+    end
+  end
+
   def update_ad(data)
     slice = data.to_slice
     if LibCrypto.evp_cipherupdate(@ctx, nil, out out_len, slice, slice.size) != 1
@@ -84,7 +97,11 @@ module QUIC
         @nonce = @iv.dup
         name = openssl_cipher_name
         @cipher_enc = OpenSSL::Cipher.new(name)
+        @cipher_enc.encrypt
+        @cipher_enc.key = @key
         @cipher_dec = OpenSSL::Cipher.new(name)
+        @cipher_dec.decrypt
+        @cipher_dec.key = @key
         @decrypt_buf = Bytes.new(DECRYPT_BUF_SIZE)
       end
 
@@ -100,9 +117,7 @@ module QUIC
       # Uses cached cipher context — no EVP_CIPHER_CTX_new() on hot path.
       def encrypt(ad : Bytes, pn : UInt64, plaintext : Bytes) : Bytes
         build_nonce(pn)
-        @cipher_enc.encrypt
-        @cipher_enc.key = @key
-        @cipher_enc.iv  = @nonce
+        @cipher_enc.reset_iv(@nonce)
         @cipher_enc.update_ad(ad)
         result = Bytes.new(plaintext.size + 16)
         n = @cipher_enc.update_into(plaintext, result)
@@ -115,9 +130,7 @@ module QUIC
       # Zero heap allocations on the hot path — uses cached cipher context.
       def encrypt_into(ad : Bytes, pn : UInt64, plaintext : Bytes, dst : Bytes) : Int32
         build_nonce(pn)
-        @cipher_enc.encrypt
-        @cipher_enc.key = @key
-        @cipher_enc.iv  = @nonce
+        @cipher_enc.reset_iv(@nonce)
         @cipher_enc.update_ad(ad)
         n = @cipher_enc.update_into(plaintext, dst)
         @cipher_enc.final
@@ -137,9 +150,7 @@ module QUIC
         actual_ct = ciphertext[0, ciphertext.size - tag_size]
         tag       = ciphertext[ciphertext.size - tag_size, tag_size]
 
-        @cipher_dec.decrypt
-        @cipher_dec.key = @key
-        @cipher_dec.iv  = @nonce
+        @cipher_dec.reset_iv(@nonce)
         @cipher_dec.update_ad(ad)
         @cipher_dec.gcm_set_tag(tag)
 
@@ -281,6 +292,9 @@ module QUIC
                else "AES-128-ECB"
                end
         @cipher = OpenSSL::Cipher.new(name)
+        @cipher.encrypt
+        @cipher.key = @key
+        @cipher.padding = false unless @algorithm == "CHACHA20"
         @mask_buf = Bytes.new(16)
         @chacha_input = Bytes.new(5, 0_u8)
       end
@@ -290,23 +304,17 @@ module QUIC
         when "CHACHA20"
           # RFC 9001 §5.4.4: counter = LE32(sample[0:4]), nonce = sample[4:16].
           # OpenSSL chacha20 IV = [counter_le32 | nonce_96bit] = sample[0:16].
-          @cipher.encrypt
-          @cipher.key = @key
-          @cipher.iv = sample
+          @cipher.reset_iv(sample)
           @cipher.update_into(@chacha_input, @mask_buf)
           # No final() for chacha20 — stream cipher, no block padding to flush.
           @mask_buf
         when "AES-256-ECB"
-          @cipher.encrypt
-          @cipher.key = @key
-          @cipher.padding = false
+          @cipher.reset_ecb
           @cipher.update_into(sample, @mask_buf)
           @cipher.final
           @mask_buf
         else
-          @cipher.encrypt
-          @cipher.key = @key
-          @cipher.padding = false
+          @cipher.reset_ecb
           @cipher.update_into(sample, @mask_buf)
           @cipher.final
           @mask_buf

@@ -110,6 +110,22 @@ module QUIC
     @@ssl_ctx_cache = {} of String => LibSSL::SSLContext
     @@ssl_ctx_mutex = Mutex.new
 
+    protected def self.generate_self_signed_cert(cert_path : String, key_path : String)
+      Log.info { "Generating self-signed TLS certificate and key via openssl..." }
+      
+      # Use openssl cli to generate a self-signed cert/key pair.
+      # This is robust across different OpenSSL API versions.
+      status = Process.run(
+        "openssl",
+        ["req", "-x509", "-newkey", "rsa:2048", "-keyout", key_path, "-out", cert_path, "-days", "365", "-nodes", "-subj", "/CN=localhost"],
+        shell: false
+      )
+      
+      unless status.success?
+        raise "Failed to generate self-signed TLS certificate automatically via 'openssl' command."
+      end
+    end
+
     @ssl : LibSSL::SSL = Pointer(Void).null.as(LibSSL::SSL)
     @ssl_ctx : LibSSL::SSLContext = Pointer(Void).null.as(LibSSL::SSLContext)
     @ssl_ctx_owned : Bool = false
@@ -177,7 +193,7 @@ module QUIC
             LibSSL.SSL_CTX_set_ciphersuites(@ssl_ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
             LibSSL.SSL_CTX_set_keylog_callback(@ssl_ctx, ->QUIC.keylog_cb)
             unless File.exists?(@config.cert_file) && File.exists?(@config.key_file)
-              raise "TLS certificates not found! Please ensure '#{@config.cert_file}' and '#{@config.key_file}' exist."
+              TLS.generate_self_signed_cert(@config.cert_file, @config.key_file)
             end
             res1 = LibSSL.ssl_ctx_use_certificate_chain_file(@ssl_ctx, @config.cert_file)
             res2 = LibSSL.ssl_ctx_use_privatekey_file(@ssl_ctx, @config.key_file, LibSSL::SSLFileType::PEM)

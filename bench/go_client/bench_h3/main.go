@@ -118,7 +118,7 @@ func runSeq(client *http.Client, url string, n int) (lats []time.Duration, errCo
 
 // ── Concurrent RPS benchmark ─────────────────────────────────────────────────
 
-func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.Duration, errCount int) {
+func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.Duration, maxLat time.Duration, errCount int) {
 	lats := make([]time.Duration, 0, n)
 	var mu sync.Mutex
 	var errs int32
@@ -152,6 +152,7 @@ func runConc(client *http.Client, url string, n, c int) (rps float64, p99 time.D
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
 	if len(lats) > 0 {
 		p99 = lats[int(float64(len(lats))*0.99)]
+		maxLat = lats[len(lats)-1]
 	}
 	rps = float64(len(lats)) / elapsed.Seconds()
 	errCount = int(errs)
@@ -211,22 +212,23 @@ type result struct {
 	seqAvg       time.Duration
 	seqP50       time.Duration
 	seqP99       time.Duration
+	seqMax       time.Duration
 	concRPS      float64
 	concP99      time.Duration
+	concMax      time.Duration
 	throughputMB float64
 }
 
-func bench(label, base string, seqN, concN, concC, tpN int) result {
-	tr := newTransport()
-	defer tr.Close()
+func bench(label, base string, seqN, concN, concC, tpN int, tr *http3.Transport) result {
 	c := &http.Client{Transport: tr}
+
 
 	lats, serr := runSeq(c, base+"/ping", seqN)
 	if serr > 0 {
 		fmt.Fprintf(os.Stderr, "  [%s] seq errors: %d\n", label, serr)
 	}
 
-	rps, cp99, cerr := runConc(c, base+"/ping", concN, concC)
+	rps, cp99, cmax, cerr := runConc(c, base+"/ping", concN, concC)
 	if cerr > 0 {
 		fmt.Fprintf(os.Stderr, "  [%s] conc errors: %d\n", label, cerr)
 	}
@@ -236,13 +238,20 @@ func bench(label, base string, seqN, concN, concC, tpN int) result {
 		fmt.Fprintf(os.Stderr, "  [%s] throughput errors: %d\n", label, terr)
 	}
 
+	var seqMax time.Duration
+	if len(lats) > 0 {
+		seqMax = lats[len(lats)-1]
+	}
+
 	return result{
 		label:        label,
 		seqAvg:       avgDur(lats),
 		seqP50:       pct(lats, 0.50),
 		seqP99:       pct(lats, 0.99),
+		seqMax:       seqMax,
 		concRPS:      rps,
 		concP99:      cp99,
+		concMax:      cmax,
 		throughputMB: mbps,
 	}
 }
@@ -268,22 +277,44 @@ func printReport(cr, go_ result) {
 	row("    avg", d(cr.seqAvg), d(go_.seqAvg))
 	row("    p50", d(cr.seqP50), d(go_.seqP50))
 	row("    p99", d(cr.seqP99), d(go_.seqP99))
+	row("    max", d(cr.seqMax), d(go_.seqMax))
 	fmt.Println("│                                                               │")
 	fmt.Println("│  Concurrent (GET /ping)                                       │")
 	row("    req/s", r(cr.concRPS), r(go_.concRPS))
 	row("    p99 latency", d(cr.concP99), d(go_.concP99))
+	row("    max latency", d(cr.concMax), d(go_.concMax))
 	fmt.Println("│                                                               │")
 	fmt.Println("│  Throughput (GET /100k)                                       │")
 	row("    MB/s", m(cr.throughputMB), m(go_.throughputMB))
 	fmt.Println("├──────────────────────────────────────────────────────────────┤")
 
 	if go_.seqAvg > 0 && cr.seqAvg > 0 {
-		latRatio := float64(go_.seqAvg) / float64(cr.seqAvg)
-		rpsRatio := cr.concRPS / go_.concRPS
-		tpRatio  := cr.throughputMB / go_.throughputMB
-		fmt.Printf("  Latency  Crystal/Go:  %.2fx  (>1 = Crystal faster)\n", latRatio)
-		fmt.Printf("  RPS      Crystal/Go:  %.2fx  (>1 = Crystal faster)\n", rpsRatio)
-		fmt.Printf("  Throughput Crystal/Go: %.2fx  (>1 = Crystal faster)\n", tpRatio)
+		// Latency (lower is better)
+		if cr.seqAvg < go_.seqAvg {
+			ratio := float64(go_.seqAvg) / float64(cr.seqAvg)
+			fmt.Printf("  Latency:     Crystal is %.2fx faster than Go (avg: %s vs %s)\n", ratio, d(cr.seqAvg), d(go_.seqAvg))
+		} else {
+			ratio := float64(cr.seqAvg) / float64(go_.seqAvg)
+			fmt.Printf("  Latency:     Go is %.2fx faster than Crystal (avg: %s vs %s)\n", ratio, d(go_.seqAvg), d(cr.seqAvg))
+		}
+
+		// RPS (higher is better)
+		if cr.concRPS > go_.concRPS {
+			ratio := cr.concRPS / go_.concRPS
+			fmt.Printf("  RPS:         Crystal is %.2fx faster than Go (RPS: %.0f vs %.0f)\n", ratio, cr.concRPS, go_.concRPS)
+		} else {
+			ratio := go_.concRPS / cr.concRPS
+			fmt.Printf("  RPS:         Go is %.2fx faster than Crystal (RPS: %.0f vs %.0f)\n", ratio, go_.concRPS, cr.concRPS)
+		}
+
+		// Throughput (higher is better)
+		if cr.throughputMB > go_.throughputMB {
+			ratio := cr.throughputMB / go_.throughputMB
+			fmt.Printf("  Throughput:  Crystal is %.2fx faster than Go (MB/s: %.1f vs %.1f)\n", ratio, cr.throughputMB, go_.throughputMB)
+		} else {
+			ratio := go_.throughputMB / cr.throughputMB
+			fmt.Printf("  Throughput:  Go is %.2fx faster than Crystal (MB/s: %.1f vs %.1f)\n", ratio, go_.throughputMB, cr.throughputMB)
+		}
 	}
 	fmt.Println("└──────────────────────────────────────────────────────────────┘")
 	fmt.Println()
@@ -293,15 +324,28 @@ func printReport(cr, go_ result) {
 
 func main() {
 	crystalPort := flag.Int("crystal-port", 4433, "Crystal quic.cr server port")
-	goPort      := flag.Int("go-port", 4444, "Go quic-go server port (started inline)")
+	goPort      := flag.Int("go-port", 4444, "Go quic-go server port")
 	seqN        := flag.Int("seq-n", 300, "Sequential requests (latency benchmark)")
 	concN       := flag.Int("conc-n", 1000, "Total requests (concurrent benchmark)")
 	concC       := flag.Int("conc-c", 50, "Concurrency (concurrent benchmark)")
 	tpN         := flag.Int("tp-n", 20, "Requests for throughput benchmark (GET /100k)")
+	serverMode  := flag.Bool("server", false, "Run Go HTTP/3 server only")
 	flag.Parse()
 
 	payload100k := make([]byte, 100*1024)
-	rand.Read(payload100k) //nolint:errcheck
+	for i := range payload100k {
+		payload100k[i] = 'x'
+	}
+
+	if *serverMode {
+		_, err := startGoServer(*goPort, payload100k)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start Go server: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Go HTTP/3 server listening on udp://127.0.0.1:%d\n", *goPort)
+		select {}
+	}
 
 	crystalBase := fmt.Sprintf("https://127.0.0.1:%d", *crystalPort)
 	goBase      := fmt.Sprintf("https://127.0.0.1:%d", *goPort)
@@ -324,40 +368,57 @@ func main() {
 		fmt.Printf("Crystal server OK on :%d\n", *crystalPort)
 	}
 
-	// Start inline Go server
-	goSrv, err := startGoServer(*goPort, payload100k)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to start Go server: %v\n", err)
-		os.Exit(1)
+	// Check Go server is reachable
+	{
+		tr := newTransport()
+		c := &http.Client{Transport: tr}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, "GET", goBase+"/ping", nil)
+		resp, err := c.Do(req)
+		tr.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Go server not reachable on :%d: %v\n", *goPort, err)
+			os.Exit(1)
+		}
+		resp.Body.Close()
+		fmt.Printf("Go server OK on :%d\n", *goPort)
 	}
-	defer goSrv.Close()
-	fmt.Printf("Go server started on :%d\n", *goPort)
 
 	fmt.Printf("Config: seq=%d  conc=%d/%d workers  tp=%d×100k\n",
 		*seqN, *concN, *concC, *tpN)
 
-	// Warm-up: 30 requests to each server (discarded)
-	fmt.Print("Warming up")
-	for _, base := range []string{crystalBase, goBase} {
-		tr := newTransport()
-		c := &http.Client{Transport: tr}
-		for i := 0; i < 30; i++ {
-			resp, err := c.Get(base + "/ping")
-			if err == nil {
-				io.Copy(io.Discard, resp.Body) //nolint:errcheck
-				resp.Body.Close()
-			}
+	fmt.Println("\nBenchmarking Crystal quic.cr…")
+	crTr := newTransport()
+	defer crTr.Close()
+	// Warm up Crystal transport to complete the handshake and OpenSSL init
+	fmt.Print("  Warming up...")
+	cCr := &http.Client{Transport: crTr}
+	for i := 0; i < 30; i++ {
+		resp, err := cCr.Get(crystalBase + "/ping")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
 		}
-		tr.Close()
-		fmt.Print(".")
 	}
 	fmt.Println(" done")
-
-	fmt.Println("\nBenchmarking Crystal quic.cr…")
-	crRes := bench("Crystal quic.cr", crystalBase, *seqN, *concN, *concC, *tpN)
+	crRes := bench("Crystal quic.cr", crystalBase, *seqN, *concN, *concC, *tpN, crTr)
 
 	fmt.Println("Benchmarking Go quic-go…")
-	goRes := bench("Go quic-go", goBase, *seqN, *concN, *concC, *tpN)
+	goTr := newTransport()
+	defer goTr.Close()
+	// Warm up Go transport to complete the handshake
+	fmt.Print("  Warming up...")
+	cGo := &http.Client{Transport: goTr}
+	for i := 0; i < 30; i++ {
+		resp, err := cGo.Get(goBase + "/ping")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			resp.Body.Close()
+		}
+	}
+	fmt.Println(" done")
+	goRes := bench("Go quic-go", goBase, *seqN, *concN, *concC, *tpN, goTr)
 
 	printReport(crRes, goRes)
 }

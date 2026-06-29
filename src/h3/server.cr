@@ -62,6 +62,7 @@ module H3
       config.initial_max_stream_data_uni         = 10_000_000_u64
 
       udp = UDPSocket.new
+      udp.reuse_port = true
       udp.bind(host, port)
       # ECN: mark outgoing UDP datagrams as ECT(0) so network routers can signal
       # congestion via CE marks in ACK frames instead of dropping packets
@@ -253,20 +254,17 @@ module H3
           ctx.response.text("Internal Server Error", 500)
         end
 
-        h3_conn.write_frame(stream, HeadersFrame.new(response.to_h3_headers))
-        body_bytes = response.body_bytes
-        h3_conn.write_frame(stream, DataFrame.new(body_bytes)) unless body_bytes.empty?
+        h3_conn.write_response(stream, ctx.response.to_h3_headers, ctx.response.body_bytes)
 
       elsif handler = @low_level_handler
         # ---- Mode 1: Low-level block handler (backwards-compatible) ---------
         begin
           resp_headers, resp_body = handler.call(req_frame.headers, body)
-          h3_conn.write_frame(stream, HeadersFrame.new(resp_headers))
-          h3_conn.write_frame(stream, DataFrame.new(resp_body)) unless resp_body.empty?
+          h3_conn.write_response(stream, resp_headers, resp_body)
         rescue e
           Log.error(exception: e) { "Low-level handler exception" }
           error_resp = {":status" => "500"}
-          h3_conn.write_frame(stream, HeadersFrame.new(error_resp))
+          h3_conn.write_response(stream, error_resp)
         end
       end
 
@@ -326,19 +324,17 @@ module H3
     # ── Private ────────────────────────────────────────────────────────────────
 
     private def extract_dcid(data : Bytes) : String
-      io      = IO::Memory.new(data)
-      first   = io.read_byte || 0_u8
+      return "unknown" if data.empty?
+      first = data[0]
       is_long = (first & 0x80) != 0
       if is_long
-        io.skip(4)   # version
-        len  = io.read_byte || 0_u8
-        dcid = Bytes.new(len)
-        io.read_fully(dcid)
-        dcid.hexstring
+        return "unknown" if data.size < 6
+        len = data[5].to_i
+        return "unknown" if data.size < 6 + len
+        data[6, len].hexstring
       else
-        dcid = Bytes.new(8)
-        io.read_fully(dcid)
-        dcid.hexstring
+        return "unknown" if data.size < 9
+        data[1, 8].hexstring
       end
     rescue e
       Log.debug { "extract_dcid failed: #{e.message}" }

@@ -1,7 +1,7 @@
 module H3
   # Wraps an incoming HTTP/3 request, exposing method, path, headers,
   # query parameters, and body in a Crystal-idiomatic interface.
-  class Request
+  struct Request
     getter method : String
     getter path : String
     getter query_string : String

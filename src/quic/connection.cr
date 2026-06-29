@@ -168,6 +168,7 @@ module QUIC
     @send_payload_io = IO::Memory.new(2048)
     @send_header_io  = IO::Memory.new(256)
     @send_ad_io      = IO::Memory.new(256)
+    @payload_reader  = SliceReader.new
     @dcid_locked = false
 
     # Key Update (RFC 9001 §6): KEY_PHASE bit in short-header packets.
@@ -454,15 +455,14 @@ module QUIC
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len ... packet_end]
 
-        pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
         pn = case pn_len
-             when 1 then pn_io.read_byte.not_nil!.to_u64
-             when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
+             when 1 then final_data[pn_offset].to_u64
+             when 2
+               (final_data[pn_offset].to_u64 << 8) | final_data[pn_offset + 1].to_u64
              when 3
-               b = Bytes.new(3)
-               pn_io.read_fully(b)
-               (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
-             when 4 then IO::ByteFormat::NetworkEndian.decode(UInt32, pn_io).to_u64
+               (final_data[pn_offset].to_u64 << 16) | (final_data[pn_offset + 1].to_u64 << 8) | final_data[pn_offset + 2].to_u64
+             when 4
+               (final_data[pn_offset].to_u64 << 24) | (final_data[pn_offset + 1].to_u64 << 16) | (final_data[pn_offset + 2].to_u64 << 8) | final_data[pn_offset + 3].to_u64
              else 0_u64
              end
 
@@ -475,9 +475,9 @@ module QUIC
         space.largest_received_pn = pn if pn > space.largest_received_pn
 
         has_ack_eliciting = false
-        payload_io = IO::Memory.new(plaintext)
-        while payload_io.pos < payload_io.size
-          frame = Frame.decode(payload_io)
+        @payload_reader.reset(plaintext)
+        while @payload_reader.pos < @payload_reader.size
+          frame = Frame.decode(@payload_reader)
           unless frame.is_a?(AckFrame) || frame.is_a?(ConnectionCloseFrame) || frame.is_a?(PaddingFrame)
             has_ack_eliciting = true
           end
@@ -507,15 +507,14 @@ module QUIC
         peer_kp = (final_data[0] & 0x04_u8) != 0 ? 1_u8 : 0_u8
         ad = final_data[0...pn_offset + pn_len]
         ciphertext = final_data[pn_offset + pn_len .. -1]
-        pn_io = IO::Memory.new(final_data[pn_offset, pn_len])
         trunc_pn = case pn_len
-                   when 1 then pn_io.read_byte.not_nil!.to_u64
-                   when 2 then IO::ByteFormat::NetworkEndian.decode(UInt16, pn_io).to_u64
+                   when 1 then final_data[pn_offset].to_u64
+                   when 2
+                     (final_data[pn_offset].to_u64 << 8) | final_data[pn_offset + 1].to_u64
                    when 3
-                     b = Bytes.new(3)
-                     pn_io.read_fully(b)
-                     (b[0].to_u64 << 16) | (b[1].to_u64 << 8) | b[2].to_u64
-                   when 4 then IO::ByteFormat::NetworkEndian.decode(UInt32, pn_io).to_u64
+                     (final_data[pn_offset].to_u64 << 16) | (final_data[pn_offset + 1].to_u64 << 8) | final_data[pn_offset + 2].to_u64
+                   when 4
+                     (final_data[pn_offset].to_u64 << 24) | (final_data[pn_offset + 1].to_u64 << 16) | (final_data[pn_offset + 2].to_u64 << 8) | final_data[pn_offset + 3].to_u64
                    else 0_u64
                    end
         # RFC 9000 §A.3: reconstruct the full 62-bit PN from the truncated wire value.
@@ -563,9 +562,9 @@ module QUIC
         @space_app.largest_received_pn = pn if pn > @space_app.largest_received_pn
 
         has_ack_eliciting = false
-        payload_io = IO::Memory.new(plaintext)
-        while payload_io.pos < payload_io.size
-          frame = Frame.decode(payload_io)
+        @payload_reader.reset(plaintext)
+        while @payload_reader.pos < @payload_reader.size
+          frame = Frame.decode(@payload_reader)
           unless frame.is_a?(AckFrame) || frame.is_a?(ConnectionCloseFrame) || frame.is_a?(PaddingFrame)
             has_ack_eliciting = true
           end

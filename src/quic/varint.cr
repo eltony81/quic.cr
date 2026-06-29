@@ -6,24 +6,30 @@ module QUIC
         io.write_byte(value.to_u8)
       elsif value <= 0x3fff
         v = value.to_u16 | 0x4000
-        io.write_byte(((v >> 8) & 0xff).to_u8)
-        io.write_byte((v & 0xff).to_u8)
+        buf2 = uninitialized UInt8[2]
+        buf2[0] = ((v >> 8) & 0xff).to_u8
+        buf2[1] = (v & 0xff).to_u8
+        io.write(buf2.to_slice)
       elsif value <= 0x3fffffff
         v = value.to_u64 | 0x80000000_u64
-        io.write_byte(((v >> 24) & 0xff).to_u8)
-        io.write_byte(((v >> 16) & 0xff).to_u8)
-        io.write_byte(((v >> 8) & 0xff).to_u8)
-        io.write_byte((v & 0xff).to_u8)
+        buf4 = uninitialized UInt8[4]
+        buf4[0] = ((v >> 24) & 0xff).to_u8
+        buf4[1] = ((v >> 16) & 0xff).to_u8
+        buf4[2] = ((v >> 8) & 0xff).to_u8
+        buf4[3] = (v & 0xff).to_u8
+        io.write(buf4.to_slice)
       elsif value <= 0x3fffffffffffffff_u64
         v = value | 0xc000000000000000_u64
-        io.write_byte(((v >> 56) & 0xff).to_u8)
-        io.write_byte(((v >> 48) & 0xff).to_u8)
-        io.write_byte(((v >> 40) & 0xff).to_u8)
-        io.write_byte(((v >> 32) & 0xff).to_u8)
-        io.write_byte(((v >> 24) & 0xff).to_u8)
-        io.write_byte(((v >> 16) & 0xff).to_u8)
-        io.write_byte(((v >> 8) & 0xff).to_u8)
-        io.write_byte((v & 0xff).to_u8)
+        buf8 = uninitialized UInt8[8]
+        buf8[0] = ((v >> 56) & 0xff).to_u8
+        buf8[1] = ((v >> 48) & 0xff).to_u8
+        buf8[2] = ((v >> 40) & 0xff).to_u8
+        buf8[3] = ((v >> 32) & 0xff).to_u8
+        buf8[4] = ((v >> 24) & 0xff).to_u8
+        buf8[5] = ((v >> 16) & 0xff).to_u8
+        buf8[6] = ((v >> 8) & 0xff).to_u8
+        buf8[7] = (v & 0xff).to_u8
+        io.write(buf8.to_slice)
       else
         raise Error.new("Value too large for QUIC VarInt: #{value}")
       end
@@ -34,6 +40,11 @@ module QUIC
       io = IO::Memory.new
       write(io, value)
       io.to_slice
+    end
+
+    # Decodes a QUIC variable-length integer from a SliceReader without virtual calls.
+    def self.decode(io : SliceReader) : UInt64
+      io.read_varint
     end
 
     # Decodes a QUIC variable-length integer from an IO without allocations.

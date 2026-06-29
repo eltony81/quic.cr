@@ -1,7 +1,7 @@
 module H3
   # Builds and represents an HTTP/3 response. Offers fluent helpers akin to
   # Crystal's standard `HTTP::Server::Response`.
-  class Response
+  struct Response
     STATUS_TEXTS = {
       200 => "OK",
       201 => "Created",

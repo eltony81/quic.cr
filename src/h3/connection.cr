@@ -133,6 +133,22 @@ module H3
       end
     end
 
+    def write_response(stream : IO, headers : Hash(String, String), body : Bytes = Bytes.empty)
+      # Write HEADERS frame
+      payload = @qpack_encoder.encode(headers)
+      flush_encoder_stream
+      QUIC::VarInt.write(stream, H3::FrameType::HEADERS.to_u64)
+      QUIC::VarInt.write(stream, payload.size.to_u64)
+      stream.write(payload)
+
+      # Write DATA frame if body is not empty
+      unless body.empty?
+        QUIC::VarInt.write(stream, H3::FrameType::DATA.to_u64)
+        QUIC::VarInt.write(stream, body.size.to_u64)
+        stream.write(body)
+      end
+    end
+
     # Initiates an HTTP/3 server push (RFC 9114 §4.6).
     # Sends PUSH_PROMISE on the client's request stream, then opens a server
     # push stream (type=0x01) carrying the push_id and the response.
