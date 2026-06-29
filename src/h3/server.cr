@@ -1,5 +1,6 @@
 require "socket"
 require "uri"
+require "./metrics"
 
 module H3
   # High-level HTTP/3 server with two operation modes:
@@ -28,12 +29,32 @@ module H3
 
     @low_level_handler : LowLevelHandler?
     @router : H3::Router?
-    @shutdown_flag = Atomic(Bool).new(false)
-    @udp_socket : UDPSocket? = nil
+    @shutdown_flag      = Atomic(Bool).new(false)
+    @active_actor_count = Atomic(Int32).new(0)
+    @udp_socket         : UDPSocket? = nil
+    # Stored so drain() can close the channel to unblock router_chan.receive.
+    @router_chan_ref     : Channel(RouterMsg)? = nil
+    # Expose Prometheus metrics on this path; empty string disables the endpoint.
+    property metrics_path : String = "/metrics"
 
     def shutdown
       @shutdown_flag.set(true)
+      @router_chan_ref.try &.close rescue nil
       @udp_socket.try &.close rescue nil
+    end
+
+    # Gracefully drains the server: stops accepting new connections, sends GOAWAY
+    # to all active connections, and waits up to `timeout` for them to close.
+    # After the timeout, forces close of any remaining connections.
+    def drain(timeout : Time::Span = 30.seconds)
+      @shutdown_flag.set(true)
+      @udp_socket.try &.close rescue nil
+      @router_chan_ref.try &.close rescue nil
+      deadline = Time.monotonic + timeout
+      while Time.monotonic < deadline
+        break if @active_actor_count.get <= 0
+        sleep 10.milliseconds
+      end
     end
 
     def initialize(&handler : Hash(String, String), Bytes -> {Hash(String, String), Bytes})
@@ -85,6 +106,7 @@ module H3
       # Single RouterMsg channel avoids Crystal's select union-type merging.
       # Struct wrappers give the case/when branches distinct types to narrow on.
       router_chan = Channel(RouterMsg).new(4096 + 512)
+      @router_chan_ref = router_chan
 
       # Receiver fiber: blocking_drain waits via IO.select (fiber-aware epoll),
       # then drains all buffered packets with recvmmsg MSG_DONTWAIT. With GRO,
@@ -95,6 +117,8 @@ module H3
             n = batch_receiver.blocking_drain(udp)
             n.times do |i|
               batch_receiver.each_segment(i) do |data, addr|
+                Metrics.packet_rx
+                Metrics.bytes_rx(data.size)
                 router_chan.send(RouterPacket.new(data, addr))
               end
             end
@@ -109,7 +133,11 @@ module H3
       # Struct-tagged messages dispatch cleanly without select type merging.
       loop do
         break if @shutdown_flag.get
-        msg = router_chan.receive
+        msg = begin
+          router_chan.receive
+        rescue Channel::ClosedError
+          break
+        end
         break if @shutdown_flag.get
         case msg
         when RouterPacket
@@ -143,9 +171,12 @@ module H3
             end
             quic_conn = QUIC::Connection.new(config, is_server: true)
             h3_conn   = H3::Connection.new(quic_conn)
+            @active_actor_count.add(1)
+            Metrics.conn_open
             actor = ConnectionActor.new(
               quic_conn, h3_conn, addr, udp, self,
-              router_chan, conn_key
+              router_chan, conn_key,
+              on_close: -> { @active_actor_count.sub(1); nil }
             )
             connections[conn_key] = actor
             connections[addr_key]  = actor
@@ -236,6 +267,15 @@ module H3
         end
       end
       body = body_io.to_slice
+
+      # Prometheus metrics endpoint — served before router/handler dispatch.
+      mp = @metrics_path
+      if !mp.empty? && req_frame.headers[":path"]? == mp && req_frame.headers[":method"]? == "GET"
+        text = Metrics.prometheus_text
+        h3_conn.write_response(stream, {":status" => "200", "content-type" => "text/plain; version=0.0.4"}, text.to_slice)
+        stream.close_local if stream.responds_to?(:close_local)
+        return
+      end
 
       if router = @router
         # ---- Mode 2: Router-based dispatch ----------------------------------
