@@ -405,3 +405,142 @@ on multi-connection workloads where different actors run on different OS threads
 > UDP GRO (+17% throughput): groups multiple UDP datagrams per recvmmsg call.
 > MAX_PKT=65536 (64KB) allows up to 51 QUIC packets of 1280 bytes per slot
 > without truncation.
+
+---
+
+## 8. Go concurrent benchmark (single server)
+
+Replaces `examples/benchmark_concurrent.py`. Measures TPS and latency for concurrent HTTP/3 requests.
+
+```bash
+cd bench/go_client/bench_concurrent
+go build -o bench_concurrent .
+
+# Default: 8 concurrent conns, 3 reps
+./bench_concurrent
+
+# Custom:
+./bench_concurrent -port 4433 -conns 16 -reps 5
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-port` | 4433 | Server port |
+| `-conns` | 8 | Concurrent goroutines per round |
+| `-reps` | 3 | Repetitions per scenario |
+
+---
+
+## 9. QPACK static vs dynamic benchmark (Go)
+
+Replaces `examples/bench_qpack.py`. Compares header-compression latency with dynamic QPACK table disabled (cap=0) vs enabled (cap=4096).
+
+### 9a. Build two Crystal server binaries
+
+```bash
+# Dynamic (current default — cap=4096)
+crystal build examples/h3_server_routed.cr -o /tmp/h3testsrv_dynamic --release
+
+# Static — set QPACK capacity to 0 before building:
+#   In src/h3/connection.cr, open_qpack_streams: change 4096 → 0 in SETTINGS
+crystal build examples/h3_server_routed.cr -o /tmp/h3testsrv_static --release
+```
+
+### 9b. Run the benchmark
+
+```bash
+cd bench/go_client/bench_qpack
+go build -o bench_qpack .
+./bench_qpack
+
+# More requests:
+./bench_qpack -n 500 -batch 60
+./bench_qpack -static /path/to/static -dynamic /path/to/dynamic
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-static` | `/tmp/h3testsrv_static` | Static QPACK binary |
+| `-dynamic` | `/tmp/h3testsrv_dynamic` | Dynamic QPACK binary |
+| `-n` | 300 | Requests per scenario |
+| `-batch` | 80 | Requests per connection (< 128) |
+| `-warmup` | 20 | Warmup requests (not counted) |
+
+---
+
+## 10. Three-way benchmark (Crystal vs Go, multiple scenarios)
+
+Replaces `bench/bench.py`. Starts an inline quic-go server, runs 5 request scenarios against both Crystal and Go, prints a side-by-side comparison.
+
+```bash
+cd bench/go_client/bench_3way
+go build -o bench_3way .
+
+# Crystal must be running on :4433
+/tmp/e2e_server &
+
+./bench_3way
+
+# Heavier load:
+./bench_3way -n 200 -c 20
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-crystal-port` | 4433 | Crystal port |
+| `-go-port` | 4444 | Go inline server port |
+| `-n` | 50 | Requests per scenario |
+| `-c` | 5 | Concurrency |
+| `-warmup` | 5 | Warmup requests |
+
+---
+
+## 11. Heavy stress test: Crystal quic.cr vs Go quic-go
+
+Six stress phases covering connection setup, sustained RPS, throughput, connection churn, mixed-load, and long-lived connections. Auto-starts Crystal server if not running.
+
+### 11a. Build
+
+```bash
+cd bench/go_client/stress_test
+go build -o stress_test .
+```
+
+### 11b. Run
+
+```bash
+# Crystal server (auto-started from /tmp/e2e_server if not running)
+crystal build examples/e2e_server.cr -o /tmp/e2e_server --release
+
+./bench/go_client/stress_test/stress_test
+
+# Heavier:
+./stress_test -duration 60 -conns 500
+
+# Single phase:
+./stress_test -phases rps -duration 30 -conns 200
+```
+
+### Available flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-crystal-port` | 4433 | Crystal port |
+| `-go-port` | 4444 | Go server port (started inline) |
+| `-duration` | 30 | Seconds for time-bounded phases |
+| `-conns` | 200 | Max concurrent goroutines |
+| `-phases` | all | Comma-separated: `flood,rps,throughput,churn,mixed,longlived` |
+| `-auto-start` | true | Auto-start `/tmp/e2e_server` if not listening |
+| `-no-crystal` | false | Skip Crystal server |
+| `-no-go` | false | Skip Go server |
+
+### Phases
+
+| Phase | What it tests |
+|-------|---------------|
+| `flood` | N simultaneous new QUIC connections — connection setup overhead |
+| `rps` | Peak sustained RPS on reused connections (GET /ping) |
+| `throughput` | 100KB download stress, measures MB/s |
+| `churn` | New connection per request, timed — connections/s |
+| `mixed` | 70% small GET, 20% POST 64KB, 10% GET 100KB |
+| `longlived` | 10 connections × 10000 sequential requests — stream cleanup correctness |
