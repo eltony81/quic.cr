@@ -44,10 +44,8 @@ router.get "/"           { |ctx| ctx.html "<h1>Hello HTTP/3!</h1>" }
 router.get "/users/:id"  { |ctx| ctx.json %({"id":"#{ctx.request.path_params["id"]}"}) }
 router.post "/echo"      { |ctx| ctx.text ctx.body_string }
 
-H3::Server.new(router).listen(
-  host: "0.0.0.0", port: 4433,
-  cert: "cert.pem", key: "key.pem"
-)
+# Start the server (auto-generates self-signed cert.pem/key.pem if missing)
+H3::Server.new(router).listen(host: "0.0.0.0", port: 4433)
 ```
 
 ---
