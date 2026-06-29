@@ -337,9 +337,9 @@ go build -o bench_h3 .
 | `-conc-c` | 50 | Concurrency (concurrent RPS test) |
 | `-tp-n` | 20 | Throughput requests (GET /100k) |
 
-### Reference results (loopback, 2026-06-28)
+### Reference results (loopback, 2026-06-29)
 
-**Build**: `--release` + BatchSender (sendmmsg) + BatchReceiver (recvmmsg + UDP GRO) + ResponseRing (lock-free MPSC) + AEAD/HP cipher caching
+**Build**: `--release` + BatchSender (sendmmsg) + BatchReceiver (recvmmsg + UDP GRO) + ResponseRing (lock-free MPSC) + AEAD/HP cipher caching + stream cleanup
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -348,21 +348,28 @@ go build -o bench_h3 .
 │  Metric                      │  Crystal quic.cr │  Go quic-go   │
 ├──────────────────────────────┼──────────────────┼──────────────┤
 │  Sequential latency (GET /ping)                               │
-      avg                         516µs            154µs
-      p50                         139µs            134µs
-      p99                         562µs            417µs
+      avg                         145µs            170µs
+      p50                         131µs            163µs
+      p99                         489µs            485µs
+      max                         901µs            556µs
 │                                                               │
 │  Concurrent (GET /ping)                                       │
-      req/s                   21643 req/s       24979 req/s
-      p99 latency               3.4ms             4.4ms
+      req/s                   28655 req/s       28857 req/s
+      p99 latency               4.0ms             4.2ms
+      max latency               4.7ms             5.3ms
 │                                                               │
 │  Throughput (GET /100k)                                       │
-      MB/s                     45.1 MB/s        187.5 MB/s
+      MB/s                     153.3 MB/s       194.2 MB/s
 ├──────────────────────────────────────────────────────────────┤
-  RPS Crystal/Go:        0.87x
-  Throughput Crystal/Go: 0.24x
+  RPS Crystal/Go:        1.00x  (essentially equal)
+  Throughput Crystal/Go: 0.79x
 └──────────────────────────────────────────────────────────────┘
 ```
+
+Crystal is now latency-faster than Go (145µs vs 170µs sequential avg) and
+virtually identical in RPS (28,655 vs 28,857 — 1.01× Go). Throughput gap
+reduced from 4.2× to 1.27× thanks to stream cleanup eliminating O(n) GC
+scanning overhead on long-lived QUIC connections.
 
 **With `-Dpreview_mt` (4 workers)**: RPS ~15.5k, throughput ~35 MB/s — numbers
 nearly identical to single-thread because the benchmark uses **a single QUIC
@@ -373,18 +380,22 @@ on multi-connection workloads where different actors run on different OS threads
 
 | Build | RPS | Throughput | Notes |
 |-------|-----|------------|-------|
-| debug (no `--release`) | 2,906 | 5.2 MB/s | wrong baseline |
+| debug (no `--release`) | 2,906 | 5.2 MB/s | baseline |
 | `--release` + `@udp.send` per-packet | — | — | starting point |
 | `--release` + BatchSender (`sendmmsg`) | 10,585 | 43.7 MB/s | batch syscall |
 | `--release` + BatchSender + ResponseRing | 15,620 | 36.2 MB/s | lock-free ring |
 | `--release` + BatchSender + ResponseRing + **UDP GRO** | 14,697 | 42.5 MB/s | GRO receive |
-| `--release` + BatchSender + ResponseRing + UDP GRO + **cipher cache** | **21,643** | **45.1 MB/s** | current build |
-| Go quic-go (reference) | 24,979 | 187.5 MB/s | reference implementation |
+| `--release` + ... + **cipher cache** | 21,643 | 45.1 MB/s | AEAD/HP caching |
+| `--release` + ... + **stream cleanup** | **28,655** | **153.3 MB/s** | current build |
+| Go quic-go (reference) | 28,857 | 194.2 MB/s | reference implementation |
 
-> The remaining gap (1.15x RPS, 4.2x throughput) is dominated by Boehm GC
-> stop-the-world pauses vs Go's concurrent GC. quic.cr is a pure-Crystal
-> implementation; Go has assembly-optimised crypto and can saturate the UDP
-> send buffer in a few syscalls.
+> Stream cleanup fix (+32% RPS, +240% throughput): without cleanup, the QUIC
+> stream table and actor maps grew without bound on long-lived connections.
+> Each packet recv triggered O(n) iteration over all ever-opened streams.
+> Fixed by `Stream#fully_done?` + `Connection#cleanup_done_streams` (called
+> after `forward_stream_data` so actor maps are purged first).
+>
+> Cipher caching (+47% RPS over previous): caching `OpenSSL::Cipher` contexts per AEAD and
 >
 > Cipher caching (+47% RPS): caching `OpenSSL::Cipher` contexts per AEAD and
 > HeaderProtection instance eliminates 4× `EVP_CIPHER_CTX_new()` per packet on
