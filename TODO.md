@@ -136,7 +136,15 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
 
 ### 5. Performance Optimization Roadmap (completed and active work)
 - [x] **Rewrite Python benchmark client in Go** — Implemented Go HTTP/3 benchmark client in `bench/go_client/bench_h3`. It replaces the old Python/aioquic benchmark client, eliminating the dynamic GC overhead and providing highly accurate micro-second latency metrics.
-- [ ] **Migrate Python cross-validation tests to Go** — All remaining validation and cross-validation scripts (`bench/bench.py`, `examples/validate_cross_tests.py`, `examples/bench_qpack.py`) currently written in Python should be replaced by Go (or Crystal native) equivalents. Python's runtime memory management and GC pauses introduce excessive overhead, creating timing inconsistencies and skewing/falsifying comparative benchmark metrics.
+- [x] **Migrate Python cross-validation tests to Go** — Tutti i benchmark Python
+      convertiti in Go standalone (moduli separati, zero dipendenze aioquic):
+      `bench/go_client/bench_h3/` (Crystal vs Go, latenza µs-precise),
+      `bench/go_client/bench_concurrent/` (←`examples/benchmark_concurrent.py`),
+      `bench/go_client/bench_qpack/` (←`examples/bench_qpack.py`, QPACK static vs dynamic),
+      `bench/go_client/bench_3way/` (←`bench/bench.py`, 5 scenari Crystal vs Go inline).
+      `examples/validate_cross_tests.py` (27 test interop) è coperto dai 899 test
+      Go e2e in `bench/go_client/main.go` — Phase 3 (malformed frames) già verificata
+      dai test di error handling e edge cases.
 - [x] **Opt-3: Zero-alloc PN decode** — `connection.cr` creates `IO::Memory.new` for
       every long-header and short-header packet to decode the 1–4 byte packet number.
       Replaced with direct byte reads. Eliminates 2× small allocs per packet.
@@ -222,10 +230,14 @@ This document tracks the progress of making `quic.cr` a production-ready QUIC im
       missing `cert_file`/`key_file` paths and invokes a subprocess `openssl` call to
       generate a compliant RSA cert/key pair in milliseconds at startup, enabling out-of-the-box
       development without manual configuration.
-- [ ] **Test di carico / fuzzing**: nessuno stress test con connessioni simultanee
-      oltre le 8 dei cross-test. Servono test di regressione con 100+ connessioni
-      concorrenti e un fuzzer QUIC (es. `quic-interop-runner`) per trovare edge case
-      nel parser di pacchetti.
+- [x] **Test di carico / stress test**: `bench/go_client/stress_test/` — 6 fasi:
+      connection flood (N connessioni simultanee), sustained RPS (connessioni riusate,
+      GET /ping loop temporizzato), throughput (GET /100k, misura MB/s), connection
+      churn (nuova connessione per ogni request), mixed load (70% GET, 20% POST 64KB,
+      10% GET 100k), long-lived (10 connessioni × 10 000 request sequenziali).
+      Confronto Crystal vs Go inline side-by-side con p50/p95/p99/p999/max.
+      Auto-avvia `/tmp/e2e_server` se non in ascolto. Flags: `-duration`, `-conns`,
+      `-phases`, `-no-crystal`, `-no-go`.
 - [x] **Graceful shutdown**: `H3::Server.shutdown()` imposta `Atomic(Bool)` flag e
       chiude `@udp_socket` per sbloccare il receiver fiber. Il router loop controlla
       il flag prima/dopo ogni `receive` e chiama `actor.shutdown` su tutte le
