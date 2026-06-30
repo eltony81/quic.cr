@@ -34,6 +34,11 @@ benchmark/__pycache__/
 bench/go_server/go_h3_server
 bench/go_client/go_h3_client
 bench/go_client/bench_h3/bench_h3
+bench/go_client/bench_concurrent/bench_concurrent
+bench/go_client/cross_test/cross_test
+bench/go_client/bench_qpack/bench_qpack
+bench/go_client/bench_3way/bench_3way
+bench/go_client/stress_test/stress_test
 
 # Root-level built binary
 /quic
